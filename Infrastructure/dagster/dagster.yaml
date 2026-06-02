@@ -1,0 +1,35 @@
+# dagster/dagster.yaml
+#
+# Dagster instance configuration.
+# This file is copied into $DAGSTER_HOME inside Dockerfile_dagster.
+# Uses the DAGSTER_POSTGRES_* environment variables set in docker-compose.
+#
+# Reference: https://docs.dagster.io/deployment/oss/dagster-yaml
+
+storage:
+  postgres:
+    postgres_db:
+      username:
+        env: DAGSTER_POSTGRES_USER
+      password:
+        env: DAGSTER_POSTGRES_PASSWORD
+      hostname:
+        env: DAGSTER_POSTGRES_HOST
+      db_name:
+        env: DAGSTER_POSTGRES_DB
+      port: 5432
+
+run_launcher:
+  module: dagster_docker
+  class: DockerRunLauncher
+  config:
+    image: olist-user-code           # matches the `image:` tag in docker-compose
+    networks:
+      - data-platform
+    env_vars:
+      - DAGSTER_POSTGRES_USER
+      - DAGSTER_POSTGRES_PASSWORD
+      - DAGSTER_POSTGRES_HOST
+      - DAGSTER_POSTGRES_DB
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY

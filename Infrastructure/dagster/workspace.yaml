@@ -1,0 +1,11 @@
+# dagster/workspace.yaml
+#
+# Tells the webserver and daemon where your code location gRPC server is running.
+# The host must match the container_name of the user-code service in docker-compose.
+# The port must match the EXPOSE / CMD port in Dockerfile_user_code.
+
+load_from:
+  - grpc_server:
+      host: dagster-user-code
+      port: 4000
+      location_name: olist_pipeline
