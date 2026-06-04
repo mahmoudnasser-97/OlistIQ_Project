@@ -97,7 +97,7 @@ silver_orders = impute_strings(silver_orders).dropDuplicates(["order_id"])
 silver_orders.write.format("delta").mode("overwrite").save(f"{S}silver_orders")
 
 # 🛠️ 3. PROCESS: silver_products
-# ── UPDATE THIS SECTIONS IN YOUR SCRIPT ─────────────────────────────────────
+
 print("Processing: silver_products...", flush=True)
 
 # Define exactly what columns we need from the lookup dataframe
