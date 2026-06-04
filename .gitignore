@@ -1,0 +1,131 @@
+# Environment Variables
+.env
+.env.local
+.env.*.local
+.env.production.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.venv
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+jupyter_notebooks.tar.gz
+
+# Data directories (large files)
+data/*
+!data/.gitkeep
+notebooks/*
+!notebooks/.gitkeep
+!notebooks/examples/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Docker
+docker-compose.override.yml
+.dockerignore.local
+
+# Git
+.git/
+.gitmodules
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+.~*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (if using any frontend tools)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Kafka / Zookeeper / External services
+zookeeper_data/
+kafka_data/
+
+# Spark
+spark_logs/
+metastore_db/
+
+# MinIO
+minio_data/
+.minio
+
+# Database backups (large)
+*.sql
+!sql/init.sql
+
+# Local development
+.streamlit/
+.cache/
+
+# Streaming jobs temporary files
+streaming_temp/
+
+# Build artifacts
+*.war
+*.jar
+*.tar.gz
+
+# IDE cache
+.clangd/
+.gradle/
