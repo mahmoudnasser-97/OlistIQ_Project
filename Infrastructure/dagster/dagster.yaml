@@ -24,8 +24,7 @@ run_launcher:
   class: DockerRunLauncher
   config:
     image: olist-user-code           # matches the `image:` tag in docker-compose
-    networks:
-      - data-platform
+    network: olist-data-platform_data-platform  # 👈 Changed to singular "network" and removed the hyphen (-)
     env_vars:
       - DAGSTER_POSTGRES_USER
       - DAGSTER_POSTGRES_PASSWORD
