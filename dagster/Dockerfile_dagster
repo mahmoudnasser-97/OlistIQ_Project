@@ -1,0 +1,40 @@
+# =============================================================================
+# dagster/Dockerfile_dagster
+#
+# Purpose : Host image for dagster-webserver and dagster-daemon.
+#           Contains Dagster packages + config only — NO pipeline code.
+#           Pipeline code lives in Dockerfile_user_code.
+#
+# Follows the official Dagster Docker deployment pattern:
+#   https://docs.dagster.io/deployment/oss/deployment-options/docker
+#
+# Build   : handled automatically by docker-compose (build: ./dagster)
+# =============================================================================
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        dagster==1.7.15 \
+        dagster-graphql==1.7.15 \
+        dagster-webserver==1.7.15 \
+        dagster-postgres==0.23.15 \
+        dagster-docker==0.23.15
+
+# DAGSTER_HOME is where dagster.yaml and workspace.yaml must live
+ENV DAGSTER_HOME=/opt/dagster/dagster_home
+
+RUN mkdir -p $DAGSTER_HOME
+
+# Copy instance config and workspace definition into the image
+COPY dagster.yaml workspace.yaml $DAGSTER_HOME/
+
+WORKDIR $DAGSTER_HOME
