@@ -357,6 +357,9 @@ services:
       DAGSTER_POSTGRES_PASSWORD: dagster
       DAGSTER_POSTGRES_HOST: postgres-meta
       DAGSTER_POSTGRES_DB: dagster
+      # ⬇️ Added MinIO credentials for the webserver core ⬇️
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -379,6 +382,9 @@ services:
       DAGSTER_POSTGRES_PASSWORD: dagster
       DAGSTER_POSTGRES_HOST: postgres-meta
       DAGSTER_POSTGRES_DB: dagster
+      # ⬇️ Added MinIO credentials for the daemon launcher ⬇️
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
