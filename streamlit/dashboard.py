@@ -9,8 +9,7 @@ import requests
 # PAGE CONFIGURATION
 
 st.set_page_config(
-    page_title="OlistIQ — Live Operations Dashboard",
-    page_icon="🛒",
+    page_title="OlistIQ:Live Operations Dashboard",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -27,21 +26,24 @@ r = get_redis_connection()
 
 @st.cache_resource
 def get_brazil_geojson():
-    urls = [
-        "https://raw.githubusercontent.com/giuliano-oliveira/geodata-br-states/main/geojson/br_states.json",
-        "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
-    ]
-    for url in urls:
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data and "features" in data and len(data["features"]) > 0:
-                    props = data["features"][0]["properties"]
-                    return data, props
-        except Exception:
-            continue
-    return None, {}
+    """
+    Download Brazil states GeoJSON and identify the correct property key
+    for state name matching. Returns (geojson_dict, name_key_string)
+    """
+    url = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
+    try:
+        response = requests.get(url, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            if data and "features" in data:
+                props = data["features"][0].get("properties", {})
+                for key, val in props.items():
+                    if isinstance(val, str) and len(val) > 3 and val[0].isupper():
+                        return data, key
+            return data, "name"
+    except Exception:
+        pass
+    return None, "name"
 
 # DATA FETCHING FUNCTIONS
 
@@ -198,7 +200,7 @@ st.markdown(
     """
     <div style="text-align:center; padding: 10px 0 24px 0;">
         <h1 style="color:#4CAF50; font-size:36px; margin:0;">
-            OlistIQ — Live Operations Dashboard
+            OlistIQ: Live Operations Dashboard
         </h1>
         <p style="color:#aaa; margin:6px 0 0 0;">
             Real-time order stream · Kafka → Spark Streaming → Redis → Streamlit
@@ -215,7 +217,6 @@ placeholder = st.empty()
 
 while True:
 
-    # Fetch all data at start of each cycle
     metrics         = fetch_metrics()
     status_df       = fetch_counter("counters:status")
     payment_df      = fetch_counter("counters:payment")
@@ -276,7 +277,7 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 2 — ORDER STATUS + PAYMENT TYPE
+        # SECTION 2: ORDER STATUS + PAYMENT TYPE
         st.markdown("### Order & Payment Analysis")
         col_left, col_right = st.columns(2)
 
@@ -318,7 +319,7 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 3 — INSTALLMENTS + REVIEW SCORE DISTRIBUTION
+        # SECTION 3: INSTALLMENTS + REVIEW SCORE DISTRIBUTION
         st.markdown("### Payment Installments & Review Score Distribution")
         col_left2, col_right2 = st.columns(2)
 
@@ -381,7 +382,7 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 4 — TOP CATEGORIES + PRICE DISTRIBUTION
+        # SECTION 4: TOP CATEGORIES + PRICE DISTRIBUTION
         st.markdown("### Product & Pricing Analysis")
         col_left3, col_right3 = st.columns(2)
 
@@ -436,7 +437,7 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 5 — PRODUCT PHOTOS + FREIGHT DISTRIBUTION
+        # SECTION 5: PRODUCT PHOTOS + FREIGHT DISTRIBUTION
         st.markdown("### Product Quality & Freight Analysis")
         col_left4, col_right4 = st.columns(2)
 
@@ -494,7 +495,7 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 6 — CUSTOMER vs SELLER STATE + REVIEW COMMENT RATE
+        # SECTION 6: CUSTOMER vs SELLER STATE + REVIEW COMMENT RATE
         st.markdown("### Geographic & Engagement Analysis")
         col_left5, col_right5 = st.columns(2)
 
@@ -557,77 +558,70 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 7 — BRAZIL STATE MAP (FIXED WITH GEOJSON)
+        # SECTION 7: BRAZIL STATE MAP
         st.markdown("### Orders by Brazilian State")
 
-        geojson_data, sample_props = get_brazil_geojson()
+        geojson_data, name_key = get_brazil_geojson()
 
-        if not state_df.empty and geojson_data is not None:
+        if not state_df.empty:
+            if geojson_data is not None:
+                map_df = state_df.copy()
 
-            # Determine which property key holds the state name
-            name_key = "name"
-            if sample_props:
-                for candidate in ["name", "NOME_UF", "nm_estado", "NM_ESTADO"]:
-                    if candidate in sample_props:
-                        name_key = candidate
-                        break
+                map_df["sigla"] = map_df["label"]
 
-            map_df = state_df.copy()
-            map_df["state_name"] = map_df["label"].map(STATE_NAME_MAP)
-            map_df = map_df.dropna(subset=["state_name"])
+                fig = px.choropleth(
+                    map_df,
+                    geojson=geojson_data,
+                    locations="sigla",
+                    featureidkey="properties.sigla",
+                    color="count",
+                    color_continuous_scale="Greens",
+                    hover_name="label",
+                    hover_data={"count": True, "sigla": False},
+                    range_color=[0, max(map_df["count"].max(), 1)]
+                )
+                fig.update_geos(
+                    fitbounds="locations",
+                    visible=False
+                )
+                fig.update_layout(
+                    **LAYOUT_DEFAULTS,
+                    geo=dict(bgcolor="rgba(0,0,0,0)"),
+                    coloraxis_showscale=True,
+                    coloraxis_colorbar=dict(
+                        title="Orders",
+                        tickfont=dict(color="white"),
+                        titlefont=dict(color="white")
+                    ),
+                    height=450
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-            fig = px.choropleth(
-                map_df,
-                geojson=geojson_data,
-                locations="state_name",
-                featureidkey=f"properties.{name_key}",
-                color="count",
-                color_continuous_scale="Greens",
-                hover_name="label",
-                hover_data={"count": True, "state_name": False},
-                range_color=[0, map_df["count"].max()]
-            )
-            fig.update_geos(
-                fitbounds="locations",
-                visible=False
-            )
-            fig.update_layout(
-                **LAYOUT_DEFAULTS,
-                geo=dict(bgcolor="rgba(0,0,0,0)"),
-                coloraxis_showscale=True,
-                coloraxis_colorbar=dict(
-                    title="Orders",
-                    tickfont=dict(color="white"),
-                    titlefont=dict(color="white")
-                ),
-                height=450
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        elif state_df.empty:
-            st.info("Waiting for state data from the stream...")
+            else:
+                # GeoJSON unavailable, fall back to bar chart
+                st.markdown("#### Orders by State")
+                top_states = state_df.head(15)
+                fig = px.bar(
+                    top_states,
+                    x="label", y="count",
+                    color="count",
+                    color_continuous_scale="Greens",
+                    text="count"
+                )
+                fig.update_layout(
+                    **LAYOUT_DEFAULTS,
+                    xaxis_title="State",
+                    yaxis_title="Orders",
+                    coloraxis_showscale=False
+                )
+                fig.update_traces(textposition="outside")
+                st.plotly_chart(fig, use_container_width=True)
         else:
-            st.markdown("#### Orders by State (map unavailable — showing bar chart)")
-            top_states = state_df.head(15)
-            fig = px.bar(
-                top_states,
-                x="label", y="count",
-                color="count",
-                color_continuous_scale="Greens",
-                text="count"
-            )
-            fig.update_layout(
-                **LAYOUT_DEFAULTS,
-                xaxis_title="State",
-                yaxis_title="Orders",
-                coloraxis_showscale=False
-            )
-            fig.update_traces(textposition="outside")
-            st.plotly_chart(fig, use_container_width=True)
+            st.info("Waiting for state data from the stream")
 
         st.markdown("---")
 
-        # SECTION 8 — TOP CUSTOMER CITIES + TOP SELLER CITIES
+        # SECTION 8: TOP CUSTOMER CITIES + TOP SELLER CITIES
         st.markdown("### Top Cities Analysis")
         col_left6, col_right6 = st.columns(2)
 
@@ -677,8 +671,8 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 9 — LIVE EVENT FEED TABLE
-        st.markdown("#### Live Event Feed — Last 15 Orders")
+        # SECTION 9: LIVE EVENT FEED TABLE
+        st.markdown("#### Live Event Feed: Last 15 Orders")
         if not recent_df.empty:
             display_cols = [
                 "order_id", "order_status", "customer_state",
@@ -707,7 +701,7 @@ while True:
                 hide_index=True
             )
         else:
-            st.info("Waiting for events from the stream...")
+            st.info("Waiting for events from the stream")
 
         # FOOTER
         st.markdown(
