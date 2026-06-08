@@ -94,7 +94,7 @@ def save_gold(df, table):
     df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(f"{GOLD}{table}")
     df.write.jdbc(url=PG_URL, table=f"public.{table}", mode="overwrite", properties=PG_PROPS)
     df.unpersist()
-    print(f"Saved {table}. Rows: {df.count()}", flush=True)
+    print(f"Saved {table}. Rows: {row_count}", flush=True)
 
 def date_sk(ts_col):
     return F.when(F.col(ts_col).isNotNull(), F.date_format(F.col(ts_col), "yyyyMMdd").cast(IntegerType())).otherwise(F.lit(None).cast(IntegerType()))
