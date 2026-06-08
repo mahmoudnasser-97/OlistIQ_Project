@@ -89,8 +89,11 @@ def read_silver(name):
     return spark.read.format("delta").load(f"{SILVER}{name}")
 
 def save_gold(df, table):
+    df.cache()
+    row_count = df.count()
     df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(f"{GOLD}{table}")
     df.write.jdbc(url=PG_URL, table=f"public.{table}", mode="overwrite", properties=PG_PROPS)
+    df.unpersist()
     print(f"Saved {table}. Rows: {df.count()}", flush=True)
 
 def date_sk(ts_col):
