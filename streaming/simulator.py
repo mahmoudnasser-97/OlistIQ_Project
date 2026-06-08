@@ -11,26 +11,25 @@ from kafka.errors import NoBrokersAvailable
 
 KAFKA_BROKER = "localhost:9092"
 KAFKA_TOPIC = "olist_orders_stream"
-
 SLEEP_BETWEEN_EVENTS = 2
 
-fake = Faker("pt_BR")  # Brazilian locale for realistic Brazilian names/addresses
+fake = Faker("pt_BR")
 
 # REFERENCE DATA
-# These lists mirror the real categorical values found in the
-# Olist CSV files
 
 PAYMENT_TYPES = ["credit_card", "boleto", "voucher", "debit_card"]
+
+# Realistic Brazilian e-commerce payment distribution
+# credit_card dominates, boleto second, voucher third, debit_card least
+PAYMENT_TYPE_WEIGHTS = [45, 30, 15, 10]
 
 ORDER_STATUSES = [
     "created", "approved", "processing",
     "shipped", "delivered", "canceled", "unavailable"
 ]
-
-# Weighted so most orders end up delivered, just like the real dataset
 ORDER_STATUS_WEIGHTS = [2, 5, 5, 15, 65, 6, 2]
 
-PRODUCT_CATEGORIES = [
+PRODUCT_CATEGORIES_PT = [
     "beleza_saude", "informatica_acessorios", "automotivo",
     "cama_mesa_banho", "moveis_decoracao", "esporte_lazer",
     "perfumaria", "utilidades_domesticas", "telefonia",
@@ -40,14 +39,52 @@ PRODUCT_CATEGORIES = [
     "construcao_ferramentas_seguranca", "fashion_bolsas_e_acessorios"
 ]
 
+# Weighted so popular categories appear more — matches real Olist distribution
+PRODUCT_CATEGORY_WEIGHTS = [
+    12, 10, 8, 9, 7, 8, 6, 7, 6,
+    4, 5, 4, 5, 5, 3, 2, 3, 2, 2, 2
+]
+
+# Translation map: Portuguese → English
+CATEGORY_TRANSLATION = {
+    "beleza_saude": "Beauty & Health",
+    "informatica_acessorios": "Computers & Accessories",
+    "automotivo": "Automotive",
+    "cama_mesa_banho": "Bed, Bath & Table",
+    "moveis_decoracao": "Furniture & Decor",
+    "esporte_lazer": "Sports & Leisure",
+    "perfumaria": "Perfumery",
+    "utilidades_domesticas": "Home Utilities",
+    "telefonia": "Telephony",
+    "watches_gifts": "Watches & Gifts",
+    "alimentos_bebidas": "Food & Beverages",
+    "bebes": "Baby Products",
+    "moda_calcados_acessorios": "Fashion & Accessories",
+    "eletronicos": "Electronics",
+    "ferramentas_jardim": "Garden Tools",
+    "papelaria": "Stationery",
+    "brinquedos": "Toys",
+    "livros_interesse_geral": "Books",
+    "construcao_ferramentas_seguranca": "Construction & Safety",
+    "fashion_bolsas_e_acessorios": "Bags & Accessories"
+}
+
 BRAZILIAN_STATES = [
     "SP", "RJ", "MG", "RS", "PR", "SC", "BA", "GO",
     "ES", "PE", "CE", "PA", "MT", "MS", "RN", "PB",
     "AM", "AL", "SE", "PI", "RO", "TO", "AC", "AP", "MA", "DF"
 ]
 
+# Weighted to reflect real Brazilian e-commerce geography
+# SP dominates, followed by RJ, MG, RS, PR
+BRAZILIAN_STATE_WEIGHTS = [
+    25, 12, 10, 7, 7, 6, 5, 4,
+    3, 3, 3, 2, 2, 2, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+]
+
+
 # GENERATOR FUNCTIONS
-# Each function mirrors the schema of its corresponding CSV file
 
 def generate_customer():
     """
@@ -55,7 +92,7 @@ def generate_customer():
     Fields: customer_id, customer_unique_id, customer_zip_code_prefix,
             customer_city, customer_state
     """
-    state = random.choice(BRAZILIAN_STATES)
+    state = random.choices(BRAZILIAN_STATES, weights=BRAZILIAN_STATE_WEIGHTS, k=1)[0]
     return {
         "customer_id": str(uuid.uuid4()),
         "customer_unique_id": str(uuid.uuid4()),
@@ -70,7 +107,7 @@ def generate_seller():
     Mirrors: olist_sellers_dataset.csv
     Fields: seller_id, seller_zip_code_prefix, seller_city, seller_state
     """
-    state = random.choice(BRAZILIAN_STATES)
+    state = random.choices(BRAZILIAN_STATES, weights=BRAZILIAN_STATE_WEIGHTS, k=1)[0]
     return {
         "seller_id": str(uuid.uuid4()),
         "seller_zip_code_prefix": str(random.randint(10000, 99999)),
@@ -82,18 +119,28 @@ def generate_seller():
 def generate_product():
     """
     Mirrors: olist_products_dataset.csv
-    Fields: product_id, product_category_name, product_name_length,
-            product_description_length, product_photos_qty,
-            product_weight_g, product_length_cm,
-            product_height_cm, product_width_cm
+    Fields: product_id, product_category_name, product_category_name_english,
+            product_name_length, product_description_length, product_photos_qty,
+            product_weight_g, product_length_cm, product_height_cm, product_width_cm
     """
+    category_pt = random.choices(PRODUCT_CATEGORIES_PT, weights=PRODUCT_CATEGORY_WEIGHTS, k=1)[0]
+    category_en = CATEGORY_TRANSLATION[category_pt]
     return {
         "product_id": str(uuid.uuid4()),
-        "product_category_name": random.choice(PRODUCT_CATEGORIES),
+        "product_category_name": category_pt,
+        "product_category_name_english": category_en,
         "product_name_length": random.randint(20, 60),
         "product_description_length": random.randint(100, 3000),
-        "product_photos_qty": random.randint(1, 6),
-        "product_weight_g": random.randint(100, 30000),
+        "product_photos_qty": random.choices(
+            [1, 2, 3, 4, 5, 6],
+            weights=[30, 25, 20, 12, 8, 5],
+            k=1
+        )[0],
+        "product_weight_g": random.choices(
+            list(range(100, 30001, 100)),
+            weights=None,
+            k=1
+        )[0],
         "product_length_cm": random.randint(10, 100),
         "product_height_cm": random.randint(5, 50),
         "product_width_cm": random.randint(10, 100)
@@ -115,6 +162,9 @@ def generate_order(customer_id):
 
     status = random.choices(ORDER_STATUSES, weights=ORDER_STATUS_WEIGHTS, k=1)[0]
 
+    # Compute delivery time in days for analytics
+    delivery_days = (delivered_time - purchase_time).days
+
     return {
         "order_id": str(uuid.uuid4()),
         "customer_id": customer_id,
@@ -123,7 +173,8 @@ def generate_order(customer_id):
         "order_approved_at": approved_time.isoformat(),
         "order_delivered_carrier_date": carrier_time.isoformat(),
         "order_delivered_customer_date": delivered_time.isoformat(),
-        "order_estimated_delivery_date": estimated_time.isoformat()
+        "order_estimated_delivery_date": estimated_time.isoformat(),
+        "delivery_days": delivery_days
     }
 
 
@@ -139,7 +190,7 @@ def generate_order_item(order_id, seller_id, product_id):
 
     return {
         "order_id": order_id,
-        "order_item_id": 1,  # simplified: one item per order event
+        "order_item_id": 1,
         "product_id": product_id,
         "seller_id": seller_id,
         "shipping_limit_date": shipping_limit.isoformat(),
@@ -154,8 +205,12 @@ def generate_payment(order_id):
     Fields: order_id, payment_sequential, payment_type,
             payment_installments, payment_value
     """
-    payment_type = random.choice(PAYMENT_TYPES)
-    installments = 1 if payment_type != "credit_card" else random.randint(1, 12)
+    payment_type = random.choices(PAYMENT_TYPES, weights=PAYMENT_TYPE_WEIGHTS, k=1)[0]
+    installments = 1 if payment_type != "credit_card" else random.choices(
+        [1, 2, 3, 4, 6, 8, 10, 12],
+        weights=[20, 18, 16, 14, 12, 8, 6, 6],
+        k=1
+    )[0]
     value = round(random.uniform(20.0, 1000.0), 2)
 
     return {
@@ -177,13 +232,15 @@ def generate_review(order_id):
     score = random.choices([1, 2, 3, 4, 5], weights=[5, 5, 10, 20, 60], k=1)[0]
     creation = datetime.now()
     answer = creation + timedelta(days=random.randint(1, 7))
+    has_comment = random.random() > 0.4
 
     return {
         "review_id": str(uuid.uuid4()),
         "order_id": order_id,
         "review_score": score,
         "review_comment_title": fake.sentence(nb_words=4) if random.random() > 0.5 else "",
-        "review_comment_message": fake.sentence(nb_words=12) if random.random() > 0.4 else "",
+        "review_comment_message": fake.sentence(nb_words=12) if has_comment else "",
+        "review_has_comment": has_comment,
         "review_creation_date": creation.isoformat(),
         "review_answer_timestamp": answer.isoformat()
     }
@@ -191,7 +248,9 @@ def generate_review(order_id):
 
 def generate_full_event():
     """
-    Combines all sub-generators into one self-contained order event
+    Combines all sub-generators into one self-contained order event.
+    This denormalized structure is ideal for stream processing because
+    Spark Streaming gets all context in a single message.
     """
     customer = generate_customer()
     seller = generate_seller()
@@ -217,7 +276,7 @@ def generate_full_event():
 
 def create_producer():
     """
-    Tries to connect to Kafka and retries every 5 seconds if not ready
+    Tries to connect to Kafka. Retries every 5 seconds if not ready.
     """
     while True:
         try:
@@ -238,7 +297,7 @@ def run_simulator():
     event_count = 0
 
     print(f"Starting Olist event simulator → topic: {KAFKA_TOPIC}")
-    print(f"   Sending one event every {SLEEP_BETWEEN_EVENTS} seconds. Press Ctrl+C to stop.\n")
+    print(f"Sending one event every {SLEEP_BETWEEN_EVENTS} seconds. Press Ctrl+C to stop.\n")
 
     while True:
         try:
@@ -257,14 +316,16 @@ def run_simulator():
                 f"[{event_count}] Sent order {order_id[:8]}... | "
                 f"Status: {event['order']['order_status']} | "
                 f"Payment: {event['payment']['payment_type']} | "
+                f"Installments: {event['payment']['payment_installments']} | "
                 f"Score: {event['review']['review_score']}⭐ | "
+                f"Category: {event['product']['product_category_name_english']} | "
                 f"Value: R${event['payment']['payment_value']}"
             )
 
             time.sleep(SLEEP_BETWEEN_EVENTS)
 
         except KeyboardInterrupt:
-            print("\n Simulator stopped by user")
+            print("\nSimulator stopped by user.")
             producer.close()
             break
 
