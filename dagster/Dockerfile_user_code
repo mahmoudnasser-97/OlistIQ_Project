@@ -1,13 +1,5 @@
 # =============================================================================
 # dagster/Dockerfile_user_code
-#
-# Purpose : Code location image — runs a Dagster gRPC server that serves
-#           your @asset / @job definitions to the webserver and daemon.
-#           This image is ALSO used when Dagster launches individual runs
-#           (set via DAGSTER_CURRENT_IMAGE env var).
-#
-# Pattern : One container per code location. If you split your pipeline
-#           into multiple modules later, add a second service + Dockerfile.
 # =============================================================================
 
 FROM python:3.11-slim
@@ -15,6 +7,7 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# ── OS packages ──────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         wget \
@@ -22,38 +15,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+# ── Java ─────────────────────────────────────────────────────────────────────
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# ── Install Spark (needed so spark-submit works inside the run container) ────
-ENV SPARK_VERSION=3.5.0
+# ── Spark (installed via PySpark — no tarball download needed) ────────────────
+# pyspark ships its own spark-submit under $VIRTUAL_ENV/lib/pythonX.Y/site-packages/pyspark
+# We symlink it to /opt/spark so spark-submit is on PATH as expected.
 ENV SPARK_HOME=/opt/spark
-
-RUN wget -q \
-    "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" \
-    -O /tmp/spark.tgz \
-    && tar -xzf /tmp/spark.tgz -C /opt \
-    && mv /opt/spark-${SPARK_VERSION}-bin-hadoop3 ${SPARK_HOME} \
-    && rm /tmp/spark.tgz
-
 ENV PATH="${SPARK_HOME}/bin:${PATH}"
 
 # ── Python packages ───────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
-        # Dagster core
         dagster==1.7.15 \
         dagster-postgres==0.23.15 \
         dagster-docker==0.23.15 \
-        # Spark / Delta
         pyspark==3.5.0 \
         delta-spark==3.0.0 \
-        # Cloud / storage
         boto3==1.34.0 \
         psycopg2-binary==2.9.9 \
-        # Data
         pandas==2.0.3 \
         pyarrow==14.0.2
+
+# ── Symlink PySpark's bundled Spark to /opt/spark ────────────────────────────
+RUN PYSPARK_HOME=$(python -c "import pyspark; import os; print(os.path.dirname(pyspark.__file__))") \
+    && ln -s "$PYSPARK_HOME" /opt/spark
 
 # ── Spark JARs ────────────────────────────────────────────────────────────────
 ENV DELTA_VERSION=3.0.0
@@ -73,22 +60,24 @@ RUN wget -q -P ${JARS} \
     && wget -q -P ${JARS} \
       "${MAVEN}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" \
     && wget -q -P ${JARS} \
-      "https://jdbc.postgresql.org/download/postgresql-${PG_JDBC_VERSION}.jar"
+      "https://jdbc.postgresql.org/download/postgresql-${PG_JDBC_VERSION}.jar" \
+    && echo "JARs installed:" && ls ${JARS} | grep -E "delta|hadoop-aws|aws-java|postgresql"
 
 # ── spark-defaults.conf ───────────────────────────────────────────────────────
-RUN cat > ${SPARK_HOME}/conf/spark-defaults.conf << 'EOF'
-spark.master                                    spark://spark-master:7077
-spark.sql.extensions                            io.delta.sql.DeltaSparkSessionExtension
-spark.sql.catalog.spark_catalog                 org.apache.spark.sql.delta.catalog.DeltaCatalog
-spark.hadoop.fs.s3a.endpoint                    http://minio:9000
-spark.hadoop.fs.s3a.access.key                  minioadmin
-spark.hadoop.fs.s3a.secret.key                  minioadmin
-spark.hadoop.fs.s3a.path.style.access           true
-spark.hadoop.fs.s3a.impl                        org.apache.hadoop.fs.s3a.S3AFileSystem
-spark.hadoop.fs.s3a.aws.credentials.provider    org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
-spark.sql.shuffle.partitions                    8
-spark.databricks.delta.schema.autoMerge.enabled true
-EOF
+RUN mkdir -p ${SPARK_HOME}/conf \
+    && { printf '%s\n' \
+      'spark.master                                    spark://spark-master:7077' \
+      'spark.sql.extensions                            io.delta.sql.DeltaSparkSessionExtension' \
+      'spark.sql.catalog.spark_catalog                 org.apache.spark.sql.delta.catalog.DeltaCatalog' \
+      'spark.hadoop.fs.s3a.endpoint                    http://minio:9000' \
+      'spark.hadoop.fs.s3a.access.key                  minioadmin' \
+      'spark.hadoop.fs.s3a.secret.key                  minioadmin' \
+      'spark.hadoop.fs.s3a.path.style.access           true' \
+      'spark.hadoop.fs.s3a.impl                        org.apache.hadoop.fs.s3a.S3AFileSystem' \
+      'spark.hadoop.fs.s3a.aws.credentials.provider    org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider' \
+      'spark.sql.shuffle.partitions                    8' \
+      'spark.databricks.delta.schema.autoMerge.enabled true' ; } \
+      > ${SPARK_HOME}/conf/spark-defaults.conf
 
 # ── Copy pipeline code ────────────────────────────────────────────────────────
 WORKDIR /opt/dagster/app
@@ -96,7 +85,6 @@ COPY pipelines/ /opt/dagster/app/
 
 EXPOSE 4000
 
-# Health check used by docker-compose depends_on
 HEALTHCHECK \
     --timeout=3s \
     --start-period=10s \
@@ -104,7 +92,6 @@ HEALTHCHECK \
     --retries=20 \
     CMD ["dagster", "api", "grpc-health-check", "-p", "4000"]
 
-# Starts the gRPC code server. Dagster overrides CMD when launching individual runs.
 CMD ["dagster", "code-server", "start", \
      "-h", "0.0.0.0", \
      "-p", "4000", \
