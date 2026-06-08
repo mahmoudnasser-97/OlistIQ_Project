@@ -38,6 +38,9 @@ spark = (SparkSession.builder
     .config("spark.hadoop.fs.s3a.secret.key", "minioadmin")
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+    .config("spark.hadoop.fs.s3a.multipart.size",   "104857600")
+    .config("spark.hadoop.fs.s3a.fast.upload",      "true")
     .config("spark.sql.shuffle.partitions", "4")
     .getOrCreate())
 

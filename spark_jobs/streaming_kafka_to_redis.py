@@ -1,21 +1,17 @@
 import json
 import redis
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, from_json, to_timestamp, window,
-    avg, count, sum as spark_sum,
-    max as spark_max, min as spark_min
-)
+from pyspark.sql.functions import col, from_json
 from pyspark.sql.types import (
     StructType, StructField, StringType,
-    DoubleType, IntegerType, TimestampType
+    DoubleType, IntegerType, BooleanType
 )
 
 # CONFIGURATION
 
-KAFKA_BROKER = "kafka:29092"       
+KAFKA_BROKER = "kafka:29092"
 KAFKA_TOPIC = "olist_orders_stream"
-REDIS_HOST = "redis"               
+REDIS_HOST = "redis"
 REDIS_PORT = 6379
 CHECKPOINT_LOCATION = "/tmp/spark_checkpoints"
 
@@ -29,7 +25,8 @@ order_schema = StructType([
     StructField("order_approved_at", StringType()),
     StructField("order_delivered_carrier_date", StringType()),
     StructField("order_delivered_customer_date", StringType()),
-    StructField("order_estimated_delivery_date", StringType())
+    StructField("order_estimated_delivery_date", StringType()),
+    StructField("delivery_days", IntegerType())
 ])
 
 customer_schema = StructType([
@@ -50,6 +47,7 @@ seller_schema = StructType([
 product_schema = StructType([
     StructField("product_id", StringType()),
     StructField("product_category_name", StringType()),
+    StructField("product_category_name_english", StringType()),
     StructField("product_name_length", IntegerType()),
     StructField("product_description_length", IntegerType()),
     StructField("product_photos_qty", IntegerType()),
@@ -83,6 +81,7 @@ review_schema = StructType([
     StructField("review_score", IntegerType()),
     StructField("review_comment_title", StringType()),
     StructField("review_comment_message", StringType()),
+    StructField("review_has_comment", BooleanType()),
     StructField("review_creation_date", StringType()),
     StructField("review_answer_timestamp", StringType())
 ])
@@ -99,74 +98,140 @@ event_schema = StructType([
 ])
 
 # REDIS WRITER
-# This function is called for every micro-batch Spark processes
 
 def write_to_redis(batch_df, batch_id):
-    """
-    Called by Spark for every micro-batch
-    """
     if batch_df.isEmpty():
         print(f"[Batch {batch_id}] Empty batch, skipping.")
         return
 
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-    # Convert to Pandas for easy row-by-row processing
     pdf = batch_df.toPandas()
 
-    print(f"[Batch {batch_id}] Processing {len(pdf)} events")
+    print(f"[Batch {batch_id}] Processing {len(pdf)} events...")
 
     for _, row in pdf.iterrows():
-        # 1. Storing each raw event so Streamlit can show a live feed
+
+        # 1. Store raw event hash with expanded fields
         event_key = f"event:{row['order_id']}"
         event_data = {
-            "order_id":         row["order_id"],
-            "order_status":     row["order_status"],
-            "customer_state":   row["customer_state"],
-            "product_category": row["product_category_name"],
-            "payment_type":     row["payment_type"],
-            "payment_value":    str(row["payment_value"]),
-            "review_score":     str(row["review_score"]),
-            "price":            str(row["price"]),
-            "freight_value":    str(row["freight_value"]),
-            "event_timestamp":  row["event_timestamp"]
+            "order_id":                     row["order_id"],
+            "order_status":                 row["order_status"],
+            "customer_state":               row["customer_state"],
+            "customer_city":                row["customer_city"],
+            "seller_state":                 row["seller_state"],
+            "seller_city":                  row["seller_city"],
+            "product_category":             row["product_category_name_english"],
+            "product_category_pt":          row["product_category_name"],
+            "product_photos_qty":           str(row["product_photos_qty"]),
+            "product_weight_g":             str(row["product_weight_g"]),
+            "payment_type":                 row["payment_type"],
+            "payment_value":                str(row["payment_value"]),
+            "payment_installments":         str(row["payment_installments"]),
+            "price":                        str(row["price"]),
+            "freight_value":                str(row["freight_value"]),
+            "review_score":                 str(row["review_score"]),
+            "review_has_comment":           str(row["review_has_comment"]),
+            "delivery_days":                str(row["delivery_days"]),
+            "event_timestamp":              row["event_timestamp"],
+            "order_purchase_timestamp":     row["order_purchase_timestamp"]
         }
         r.hset(event_key, mapping=event_data)
-        r.expire(event_key, 86400)  # expire after 24 hours
+        r.expire(event_key, 86400)
 
-        # 2. Pushing order_id to a list so Streamlit knows what's new
-        # We keep only the latest 200 events in this list.
+        # 2. Recent events list — same pattern as before
         r.lpush("recent_events", row["order_id"])
         r.ltrim("recent_events", 0, 199)
 
-        # 3. Incrementing running counters per order status
+        # 3. Order status counters — same pattern as before
         r.incr(f"counters:status:{row['order_status']}")
 
-        # 4. Incrementing running counters per payment type
+        # 4. Payment type counters — same pattern as before
         r.incr(f"counters:payment:{row['payment_type']}")
 
-        # 5. Increment running counters per product category
-        r.incr(f"counters:category:{row['product_category_name']}")
+        # 5. Product category counters — NOW using English name
+        r.incr(f"counters:category:{row['product_category_name_english']}")
 
-        # ----------------------------------------------------------
-        # 6. Incrementing running counters per customer state
-        # ----------------------------------------------------------
+        # 6. Customer state counters — same pattern as before
         r.incr(f"counters:state:{row['customer_state']}")
 
-        # 7. Accumulate total revenue (we store as float in a key)
+        # 7. Seller state counters — NEW
+        r.incr(f"counters:seller_state:{row['seller_state']}")
+
+        # 8. Payment installments counters
+        r.incr(f"counters:installments:{row['payment_installments']}")
+
+        # 9. Product photos qty counters — NEW
+        # ----------------------------------------------------------
+        r.incr(f"counters:photos:{row['product_photos_qty']}")
+
+        # 10. Review score counters — NEW (for score distribution bar)
+        r.incr(f"counters:review_score:{row['review_score']}")
+
+        # 11. Comment vs no comment counter — NEW
+        if row["review_has_comment"]:
+            r.incr("counters:review_has_comment:yes")
+        else:
+            r.incr("counters:review_has_comment:no")
+
+        # 12. Revenue metrics — same pattern as before
         r.incrbyfloat("metrics:total_revenue", float(row["payment_value"]))
         r.incrbyfloat("metrics:total_freight", float(row["freight_value"]))
 
-        # 8. Track review scores for running average calculation
-        # We store sum and count separately so we can compute
-        # the average at read time: avg = sum / count
+        # 13. Review score running average — same pattern as before
         r.incrbyfloat("metrics:review_score_sum", float(row["review_score"]))
         r.incr("metrics:review_score_count")
 
-        # 9. Increment total order counter
+        # 14. Total orders counter — same pattern as before
         r.incr("metrics:total_orders")
 
-    print(f"[Batch {batch_id}] Written to Redis successfully")
+        # 15. Delivery days accumulator
+        r.incrbyfloat("metrics:delivery_days_sum", float(row["delivery_days"]))
+        r.incr("metrics:delivery_days_count")
+
+        # 16. Weight accumulator
+        r.incrbyfloat("metrics:weight_sum", float(row["product_weight_g"]))
+        r.incr("metrics:weight_count")
+
+        # 17. Freight ratio accumulator
+        if float(row["payment_value"]) > 0:
+            freight_ratio = float(row["freight_value"]) / float(row["payment_value"])
+            r.incrbyfloat("metrics:freight_ratio_sum", freight_ratio)
+            r.incr("metrics:freight_ratio_count")
+
+        # 18. Price bucket counters
+        price = float(row["price"])
+        if price < 50:
+            bucket = "Under R$50"
+        elif price < 100:
+            bucket = "R$50-100"
+        elif price < 200:
+            bucket = "R$100-200"
+        elif price < 400:
+            bucket = "R$200-400"
+        else:
+            bucket = "Above R$400"
+        r.incr(f"counters:price_bucket:{bucket}")
+
+        # 19. Freight bucket counters
+        freight = float(row["freight_value"])
+        if freight < 15:
+            f_bucket = "Under R$15"
+        elif freight < 30:
+            f_bucket = "R$15-30"
+        elif freight < 50:
+            f_bucket = "R$30-50"
+        else:
+            f_bucket = "Above R$50"
+        r.incr(f"counters:freight_bucket:{f_bucket}")
+
+        # 20. Customer city counters
+        r.incr(f"counters:customer_city:{row['customer_city']}")
+
+        # 21. Seller city counters
+        r.incr(f"counters:seller_city:{row['seller_city']}")
+
+    print(f"[Batch {batch_id}] Written to Redis successfully.")
 
 
 # SPARK SESSION
@@ -193,11 +258,9 @@ def run_streaming():
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
-    print("Spark session created")
+    print("Spark session created.")
     print(f"Reading from Kafka topic: {KAFKA_TOPIC}")
 
-    # READ FROM KAFKA
- 
     raw_stream = (
         spark.readStream
         .format("kafka")
@@ -208,33 +271,49 @@ def run_streaming():
         .load()
     )
 
-    # PARSE JSON
-    
     parsed_stream = raw_stream.select(
         from_json(col("value").cast("string"), event_schema).alias("data")
     )
 
-    # FLATTEN THE NESTED STRUCTURE
-
+    # EXPANDED FLAT STREAM
     flat_stream = parsed_stream.select(
+        # Top-level
         col("data.event_timestamp"),
+
+        # Order fields
         col("data.order.order_id"),
         col("data.order.order_status"),
         col("data.order.order_purchase_timestamp"),
+        col("data.order.delivery_days"),
+
+        # Customer fields
         col("data.customer.customer_state"),
         col("data.customer.customer_city"),
+
+        # Seller fields
+        col("data.seller.seller_state"),
+        col("data.seller.seller_city"),
+
+        # Product fields
         col("data.product.product_category_name"),
+        col("data.product.product_category_name_english"),
+        col("data.product.product_photos_qty"),
         col("data.product.product_weight_g"),
+        col("data.product.product_description_length"),
+
+        # Order item fields
         col("data.order_item.price"),
         col("data.order_item.freight_value"),
+
+        # Payment fields
         col("data.payment.payment_type"),
         col("data.payment.payment_value"),
         col("data.payment.payment_installments"),
-        col("data.review.review_score"),
-        col("data.seller.seller_state")
-    )
 
-    # WRITE TO REDIS USING FOREACH BATCH
+        # Review fields
+        col("data.review.review_score"),
+        col("data.review.review_has_comment")
+    )
 
     query = (
         flat_stream.writeStream
@@ -244,7 +323,7 @@ def run_streaming():
         .start()
     )
 
-    print("Streaming query started. Processing every 10 seconds")
+    print("Streaming query started. Processing every 10 seconds.")
     query.awaitTermination()
 
 
