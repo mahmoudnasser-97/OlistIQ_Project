@@ -39,13 +39,13 @@ PRODUCT_CATEGORIES_PT = [
     "construcao_ferramentas_seguranca", "fashion_bolsas_e_acessorios"
 ]
 
-# Weighted so popular categories appear more — matches real Olist distribution
+# Weighted so popular categories appear more: matches real Olist distribution
 PRODUCT_CATEGORY_WEIGHTS = [
     12, 10, 8, 9, 7, 8, 6, 7, 6,
     4, 5, 4, 5, 5, 3, 2, 3, 2, 2, 2
 ]
 
-# Translation map: Portuguese → English
+# Translation map: Portuguese to English
 CATEGORY_TRANSLATION = {
     "beleza_saude": "Beauty & Health",
     "informatica_acessorios": "Computers & Accessories",
@@ -249,8 +249,6 @@ def generate_review(order_id):
 def generate_full_event():
     """
     Combines all sub-generators into one self-contained order event.
-    This denormalized structure is ideal for stream processing because
-    Spark Streaming gets all context in a single message.
     """
     customer = generate_customer()
     seller = generate_seller()
@@ -285,10 +283,10 @@ def create_producer():
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 key_serializer=lambda k: k.encode("utf-8")
             )
-            print(f"✅ Connected to Kafka at {KAFKA_BROKER}")
+            print(f"Connected to Kafka at {KAFKA_BROKER}")
             return producer
         except NoBrokersAvailable:
-            print(f"⏳ Kafka not ready yet, retrying in 5 seconds...")
+            print(f"Kafka not ready yet, retrying in 5 seconds...")
             time.sleep(5)
 
 
@@ -296,8 +294,8 @@ def run_simulator():
     producer = create_producer()
     event_count = 0
 
-    print(f"Starting Olist event simulator → topic: {KAFKA_TOPIC}")
-    print(f"Sending one event every {SLEEP_BETWEEN_EVENTS} seconds. Press Ctrl+C to stop.\n")
+    print(f"Starting Olist event simulator connecting to topic: {KAFKA_TOPIC}")
+    print(f"Sending one event every {SLEEP_BETWEEN_EVENTS} seconds. Press Ctrl+C to stop\n")
 
     while True:
         try:
@@ -325,7 +323,7 @@ def run_simulator():
             time.sleep(SLEEP_BETWEEN_EVENTS)
 
         except KeyboardInterrupt:
-            print("\nSimulator stopped by user.")
+            print("\nSimulator stopped by user")
             producer.close()
             break
 
