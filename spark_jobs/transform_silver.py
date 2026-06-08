@@ -156,7 +156,7 @@ def append_to_audit_log(new_errors: DataFrame, audit_path: str) -> None:
 
 
 def clean_text(col_name: str):
-    return F.lower(F.trim(F.translate(F.col(col_name).cast("string"), "", "aaaeeiooouc")))
+    return F.lower(F.trim(F.translate(F.col(col_name).cast("string"), "àáâãéêíóôõúç", "aaaeeiooouc")))
 
 
 def state_clean(col_name: str):
