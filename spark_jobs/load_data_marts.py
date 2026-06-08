@@ -122,9 +122,12 @@ def read_gold(table):
 
 def save_mart_table(schema, table):
     df = read_gold(table)
+    df.cache()
+    row_count = df.count()
     df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(f"{MART_BASE}{schema}/{table}")
     df.write.jdbc(url=PG_URL, table=f"{schema}.{table}", mode="overwrite", properties=PG_PROPS)
-    print(f"Saved {schema}.{table}. Rows: {df.count()}", flush=True)
+    df.unpersist()
+    print(f"Saved {schema}.{table}. Rows: {row_count}", flush=True)
 
 for schema, definition in MARTS.items():
     pg_exec([f"DROP SCHEMA IF EXISTS {schema} CASCADE", f"CREATE SCHEMA {schema}"])
