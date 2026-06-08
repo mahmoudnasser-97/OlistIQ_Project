@@ -27,12 +27,21 @@ r = get_redis_connection()
 
 @st.cache_resource
 def get_brazil_geojson():
-    url = "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
-    try:
-        response = requests.get(url, timeout=10)
-        return response.json()
-    except Exception:
-        return None
+    urls = [
+        "https://raw.githubusercontent.com/giuliano-oliveira/geodata-br-states/main/geojson/br_states.json",
+        "https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson"
+    ]
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data and "features" in data and len(data["features"]) > 0:
+                    props = data["features"][0]["properties"]
+                    return data, props
+        except Exception:
+            continue
+    return None, {}
 
 # DATA FETCHING FUNCTIONS
 
@@ -141,7 +150,7 @@ def metric_card(label, value, suffix="", color=None):
     )
 
 
-# PRICE BUCKET SORT ORDER
+# BUCKET SORT ORDERS
 
 PRICE_BUCKET_ORDER = [
     "Under R$50", "R$50-100", "R$100-200", "R$200-400", "Above R$400"
@@ -151,13 +160,45 @@ FREIGHT_BUCKET_ORDER = [
     "Under R$15", "R$15-30", "R$30-50", "Above R$50"
 ]
 
+# STATE NAME MAP
+
+STATE_NAME_MAP = {
+    "AC": "Acre",
+    "AL": "Alagoas",
+    "AP": "Amapá",
+    "AM": "Amazonas",
+    "BA": "Bahia",
+    "CE": "Ceará",
+    "DF": "Distrito Federal",
+    "ES": "Espírito Santo",
+    "GO": "Goiás",
+    "MA": "Maranhão",
+    "MT": "Mato Grosso",
+    "MS": "Mato Grosso do Sul",
+    "MG": "Minas Gerais",
+    "PA": "Pará",
+    "PB": "Paraíba",
+    "PR": "Paraná",
+    "PE": "Pernambuco",
+    "PI": "Piauí",
+    "RJ": "Rio de Janeiro",
+    "RN": "Rio Grande do Norte",
+    "RS": "Rio Grande do Sul",
+    "RO": "Rondônia",
+    "RR": "Roraima",
+    "SC": "Santa Catarina",
+    "SP": "São Paulo",
+    "SE": "Sergipe",
+    "TO": "Tocantins"
+}
+
 # DASHBOARD HEADER
 
 st.markdown(
     """
     <div style="text-align:center; padding: 10px 0 24px 0;">
         <h1 style="color:#4CAF50; font-size:36px; margin:0;">
-            🛒 OlistIQ — Live Operations Dashboard
+            OlistIQ — Live Operations Dashboard
         </h1>
         <p style="color:#aaa; margin:6px 0 0 0;">
             Real-time order stream · Kafka → Spark Streaming → Redis → Streamlit
@@ -175,25 +216,25 @@ placeholder = st.empty()
 while True:
 
     # Fetch all data at start of each cycle
-    metrics        = fetch_metrics()
-    status_df      = fetch_counter("counters:status")
-    payment_df     = fetch_counter("counters:payment")
-    category_df    = fetch_counter("counters:category")
-    state_df       = fetch_counter("counters:state")
+    metrics         = fetch_metrics()
+    status_df       = fetch_counter("counters:status")
+    payment_df      = fetch_counter("counters:payment")
+    category_df     = fetch_counter("counters:category")
+    state_df        = fetch_counter("counters:state")
     seller_state_df = fetch_counter("counters:seller_state")
-    installment_df = fetch_counter("counters:installments")
-    photos_df      = fetch_counter("counters:photos")
-    score_dist_df  = fetch_counter("counters:review_score")
-    comment_df     = fetch_counter("counters:review_has_comment")
-    price_df       = fetch_counter("counters:price_bucket")
-    freight_df     = fetch_counter("counters:freight_bucket")
-    city_df        = fetch_counter("counters:customer_city")
-    seller_city_df = fetch_counter("counters:seller_city")
-    recent_df      = fetch_recent_events(15)
+    installment_df  = fetch_counter("counters:installments")
+    photos_df       = fetch_counter("counters:photos")
+    score_dist_df   = fetch_counter("counters:review_score")
+    comment_df      = fetch_counter("counters:review_has_comment")
+    price_df        = fetch_counter("counters:price_bucket")
+    freight_df      = fetch_counter("counters:freight_bucket")
+    city_df         = fetch_counter("counters:customer_city")
+    seller_city_df  = fetch_counter("counters:seller_city")
+    recent_df       = fetch_recent_events(15)
 
     with placeholder.container():
 
-        # SECTION 1 — KPI CARDS ROW 1 (original 5)
+        # SECTION 1 — KPI CARDS ROW 1
         st.markdown("### Key Metrics")
         c1, c2, c3, c4, c5 = st.columns(5)
 
@@ -208,7 +249,7 @@ while True:
         with c5:
             metric_card("Total Freight", f"R$ {metrics['total_freight']:,.2f}")
 
-        # SECTION 1B — KPI CARDS ROW 2 (new metrics)
+        # SECTION 1B — KPI CARDS ROW 2
         c6, c7, c8 = st.columns(3)
 
         with c6:
@@ -284,7 +325,6 @@ while True:
         with col_left2:
             st.markdown("#### Credit Card Installment Breakdown")
             if not installment_df.empty:
-                # Sort by installment number numerically
                 installment_df["label_int"] = pd.to_numeric(
                     installment_df["label"], errors="coerce"
                 )
@@ -370,12 +410,13 @@ while True:
         with col_right3:
             st.markdown("#### Order Price Distribution")
             if not price_df.empty:
-                # Enforce logical price bucket order
                 price_df["sort_order"] = price_df["label"].apply(
                     lambda x: PRICE_BUCKET_ORDER.index(x)
                     if x in PRICE_BUCKET_ORDER else 99
                 )
-                price_df = price_df.sort_values("sort_order").reset_index(drop=True)
+                price_df = price_df.sort_values(
+                    "sort_order"
+                ).reset_index(drop=True)
 
                 fig = px.bar(
                     price_df,
@@ -453,14 +494,13 @@ while True:
 
         st.markdown("---")
 
-        # SECTION 6 — REVIEW COMMENT RATE + CUSTOMER vs SELLER STATE
+        # SECTION 6 — CUSTOMER vs SELLER STATE + REVIEW COMMENT RATE
         st.markdown("### Geographic & Engagement Analysis")
         col_left5, col_right5 = st.columns(2)
 
         with col_left5:
-            st.markdown("#### Customer vs Seller State Comparison")
+            st.markdown("#### Customer vs Seller State Comparison (Top 10)")
             if not state_df.empty and not seller_state_df.empty:
-                # Merge customer and seller state counts
                 customer_merged = state_df.rename(
                     columns={"count": "customer_orders"}
                 )
@@ -520,38 +560,32 @@ while True:
         # SECTION 7 — BRAZIL STATE MAP (FIXED WITH GEOJSON)
         st.markdown("### Orders by Brazilian State")
 
-        geojson = get_brazil_geojson()
+        geojson_data, sample_props = get_brazil_geojson()
 
-        if not state_df.empty and geojson is not None:
-            # The GeoJSON uses full state names as the id field
-            # We need to map 2-letter codes to full names for matching
-            STATE_NAME_MAP = {
-                "AC": "Acre", "AL": "Alagoas", "AP": "Amapá",
-                "AM": "Amazonas", "BA": "Bahia", "CE": "Ceará",
-                "DF": "Distrito Federal", "ES": "Espírito Santo",
-                "GO": "Goiás", "MA": "Maranhão", "MT": "Mato Grosso",
-                "MS": "Mato Grosso do Sul", "MG": "Minas Gerais",
-                "PA": "Pará", "PB": "Paraíba", "PR": "Paraná",
-                "PE": "Pernambuco", "PI": "Piauí", "RJ": "Rio de Janeiro",
-                "RN": "Rio Grande do Norte", "RS": "Rio Grande do Sul",
-                "RO": "Rondônia", "RR": "Roraima", "SC": "Santa Catarina",
-                "SP": "São Paulo", "SE": "Sergipe", "TO": "Tocantins"
-            }
+        if not state_df.empty and geojson_data is not None:
+
+            # Determine which property key holds the state name
+            name_key = "name"
+            if sample_props:
+                for candidate in ["name", "NOME_UF", "nm_estado", "NM_ESTADO"]:
+                    if candidate in sample_props:
+                        name_key = candidate
+                        break
 
             map_df = state_df.copy()
             map_df["state_name"] = map_df["label"].map(STATE_NAME_MAP)
             map_df = map_df.dropna(subset=["state_name"])
 
-            # Extract the feature id field from geojson to verify matching
             fig = px.choropleth(
                 map_df,
-                geojson=geojson,
+                geojson=geojson_data,
                 locations="state_name",
-                featureidkey="properties.name",
+                featureidkey=f"properties.{name_key}",
                 color="count",
                 color_continuous_scale="Greens",
                 hover_name="label",
-                hover_data={"count": True, "state_name": False}
+                hover_data={"count": True, "state_name": False},
+                range_color=[0, map_df["count"].max()]
             )
             fig.update_geos(
                 fitbounds="locations",
@@ -573,7 +607,6 @@ while True:
         elif state_df.empty:
             st.info("Waiting for state data from the stream...")
         else:
-            # Fallback if GeoJSON fails to load — use bar chart instead
             st.markdown("#### Orders by State (map unavailable — showing bar chart)")
             top_states = state_df.head(15)
             fig = px.bar(
@@ -603,7 +636,7 @@ while True:
             if not city_df.empty:
                 top_cities = city_df.head(10)
                 fig = px.bar(
-                    top_cities,
+                    top_cities.sort_values("count", ascending=True),
                     x="count", y="label",
                     orientation="h",
                     color="count",
@@ -625,7 +658,7 @@ while True:
             if not seller_city_df.empty:
                 top_seller_cities = seller_city_df.head(10)
                 fig = px.bar(
-                    top_seller_cities,
+                    top_seller_cities.sort_values("count", ascending=True),
                     x="count", y="label",
                     orientation="h",
                     color="count",
@@ -679,7 +712,7 @@ while True:
         # FOOTER
         st.markdown(
             f"<p style='text-align:center; color:#555; font-size:12px;'>"
-            f"🔄 Refreshing every {REFRESH_SECONDS} seconds</p>",
+            f"Refreshing every {REFRESH_SECONDS} seconds</p>",
             unsafe_allow_html=True
         )
 
