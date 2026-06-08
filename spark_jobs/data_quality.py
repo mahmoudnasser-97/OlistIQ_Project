@@ -110,7 +110,7 @@ save_issue(
 )
 
 save_issue(
-    seller_acquisition.filter(F.col("converted_flag") == True)
+    seller_acquisition.filter(F.col("converted_flag") == F.lit(True))
     .join(silver_sellers.select("seller_id"), "seller_id", "left_anti")
     .withColumn("dq_rule", F.lit("converted_marketing_seller_not_in_silver_sellers")),
     "dq_seller_acquisition_seller_not_in_silver_sellers"
