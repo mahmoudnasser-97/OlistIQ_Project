@@ -108,7 +108,7 @@ def write_to_redis(batch_df, batch_id):
 
     pdf = batch_df.toPandas()
 
-    print(f"[Batch {batch_id}] Processing {len(pdf)} events...")
+    print(f"[Batch {batch_id}] Processing {len(pdf)} events and writing to Redis")
 
     for _, row in pdf.iterrows():
 
@@ -139,50 +139,49 @@ def write_to_redis(batch_df, batch_id):
         r.hset(event_key, mapping=event_data)
         r.expire(event_key, 86400)
 
-        # 2. Recent events list — same pattern as before
+        # 2. Recent events list
         r.lpush("recent_events", row["order_id"])
         r.ltrim("recent_events", 0, 199)
 
-        # 3. Order status counters — same pattern as before
+        # 3. Order status counters
         r.incr(f"counters:status:{row['order_status']}")
 
-        # 4. Payment type counters — same pattern as before
+        # 4. Payment type counters
         r.incr(f"counters:payment:{row['payment_type']}")
 
-        # 5. Product category counters — NOW using English name
+        # 5. Product category counters
         r.incr(f"counters:category:{row['product_category_name_english']}")
 
-        # 6. Customer state counters — same pattern as before
+        # 6. Customer state counters
         r.incr(f"counters:state:{row['customer_state']}")
 
-        # 7. Seller state counters — NEW
+        # 7. Seller state counters
         r.incr(f"counters:seller_state:{row['seller_state']}")
 
         # 8. Payment installments counters
         r.incr(f"counters:installments:{row['payment_installments']}")
 
-        # 9. Product photos qty counters — NEW
-        # ----------------------------------------------------------
+        # 9. Product photos qty counters
         r.incr(f"counters:photos:{row['product_photos_qty']}")
 
-        # 10. Review score counters — NEW (for score distribution bar)
+        # 10. Review score counters
         r.incr(f"counters:review_score:{row['review_score']}")
 
-        # 11. Comment vs no comment counter — NEW
+        # 11. Comment vs no comment counter
         if row["review_has_comment"]:
             r.incr("counters:review_has_comment:yes")
         else:
             r.incr("counters:review_has_comment:no")
 
-        # 12. Revenue metrics — same pattern as before
+        # 12. Revenue metrics
         r.incrbyfloat("metrics:total_revenue", float(row["payment_value"]))
         r.incrbyfloat("metrics:total_freight", float(row["freight_value"]))
 
-        # 13. Review score running average — same pattern as before
+        # 13. Review score running average
         r.incrbyfloat("metrics:review_score_sum", float(row["review_score"]))
         r.incr("metrics:review_score_count")
 
-        # 14. Total orders counter — same pattern as before
+        # 14. Total orders counter
         r.incr("metrics:total_orders")
 
         # 15. Delivery days accumulator
@@ -231,7 +230,7 @@ def write_to_redis(batch_df, batch_id):
         # 21. Seller city counters
         r.incr(f"counters:seller_city:{row['seller_city']}")
 
-    print(f"[Batch {batch_id}] Written to Redis successfully.")
+    print(f"[Batch {batch_id}] Written to Redis successfully")
 
 
 # SPARK SESSION
@@ -258,7 +257,7 @@ def run_streaming():
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
-    print("Spark session created.")
+    print("Spark session created")
     print(f"Reading from Kafka topic: {KAFKA_TOPIC}")
 
     raw_stream = (
@@ -323,7 +322,7 @@ def run_streaming():
         .start()
     )
 
-    print("Streaming query started. Processing every 10 seconds.")
+    print("Streaming query started. Processing every 10 seconds")
     query.awaitTermination()
 
 

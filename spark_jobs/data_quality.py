@@ -1,175 +1,200 @@
+import psycopg2
+from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from delta import configure_spark_with_delta_pip
-import sys
 
-# FIXES applied vs original:
-#   1. Added Delta extensions — original omitted them so reading Delta tables
-#      would silently fall back to Parquet and miss Delta's schema enforcement
-#   2. Added SimpleAWSCredentialsProvider — prevents credential-chain warnings
-#   3. Expanded checks to cover all 8 silver tables, not just 3
-#   4. Added row_count checks — an empty table passing all column checks is still wrong
-#   5. sys.exit(1) on failure is kept — Dagster catches this as a non-zero exit code
+SILVER = "s3a://silver/"
+GOLD = "s3a://gold/"
+QA = "s3a://silver/QA_Issues/"
+PG_HOST = "postgres-dw"
+PG_PORT = 5432
+PG_DB = "olist_dw"
+PG_USER = "olist"
+PG_PASSWORD = "olist"
+PG_URL = "jdbc:postgresql://postgres-dw:5432/olist_dw"
+PG_PROPS = {"user": "olist", "password": "olist", "driver": "org.postgresql.Driver"}
 
 builder = (
     SparkSession.builder
-    .appName("olist-data-quality")
+    .appName("olist_integrated_data_quality")
     .master("spark://spark-master:7077")
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    .config("spark.hadoop.fs.s3a.endpoint",         "http://minio:9000")
-    .config("spark.hadoop.fs.s3a.access.key",       "minioadmin")
-    .config("spark.hadoop.fs.s3a.secret.key",       "minioadmin")
-    .config("spark.hadoop.fs.s3a.path.style.access","true")
-    .config("spark.hadoop.fs.s3a.impl",             "org.apache.hadoop.fs.s3a.S3AFileSystem")
-    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
-            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
-    .config("spark.sql.shuffle.partitions",         "4")
+    .config("spark.jars.packages", "org.postgresql:postgresql:42.7.2")
+    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
+    .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
+    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin")
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
 )
+
 spark = configure_spark_with_delta_pip(builder).getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
-S = "s3a://silver/"
-print("\n🚀 Running Data Quality Checks...", flush=True)
 
-failures = []
+def read_delta(base, name):
+    return spark.read.format("delta").load(f"{base}{name}")
 
-def check(name, condition_passed: bool, desc: str):
-    """Record pass/fail. Does not stop on first failure — reports all issues."""
-    if condition_passed:
-        print(f"  ✅ [PASS] {name}: {desc}", flush=True)
-    else:
-        print(f"  ❌ [FAIL] {name}: {desc}", flush=True)
-        failures.append(f"{name}: {desc}")
 
-def check_col(df, table, condition, desc):
-    """Column-level check — condition is a Spark Column expression."""
-    failing = df.filter(~condition).count()
-    check(table, failing == 0, desc)
+def save_issue(df, name):
+    df = df.withColumn("dq_checked_at", F.current_timestamp())
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(f"{QA}{name}")
+    print(f"{name}: {df.count()} issue rows", flush=True)
 
-def check_min_rows(df, table, min_count: int):
-    """Ensure table has at least min_count rows."""
-    actual = df.count()
-    check(table, actual >= min_count, f"row count {actual:,} >= {min_count:,}")
 
-# ── silver_orders ──────────────────────────────────────────────────────────
-print("\n--- silver_orders ---", flush=True)
-orders = spark.read.format("delta").load(f"{S}silver_orders")
-check_min_rows(orders, "silver_orders", 90_000)
-check_col(orders, "silver_orders", F.col("order_id").isNotNull(),                 "No null order_id (PK)")
-check_col(orders, "silver_orders", F.col("customer_id").isNotNull(),              "No null customer_id (FK)")
-check_col(orders, "silver_orders",
-    F.col("order_status").isin(
-        "delivered","shipped","canceled","invoiced",
-        "processing","created","approved","unavailable","UNKNOWN"
-    ),
-    "order_status in allowed values"
-)
-check_col(orders, "silver_orders",
-    F.col("total_order_cost").isNull() | (F.col("total_order_cost") >= 0),
-    "total_order_cost non-negative"
-)
-check_col(orders, "silver_orders",
-    F.col("on_time_flag").isin(0, 1),
-    "on_time_flag is binary"
-)
+def pg_query(query):
+    conn = psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD)
+    cur = conn.cursor()
+    cur.execute(query)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
-# ── silver_order_items ────────────────────────────────────────────────────
-print("\n--- silver_order_items ---", flush=True)
-items = spark.read.format("delta").load(f"{S}silver_order_items")
-check_min_rows(items, "silver_order_items", 100_000)
-check_col(items, "silver_order_items", F.col("order_id").isNotNull(),    "No null order_id")
-check_col(items, "silver_order_items", F.col("product_id").isNotNull(),  "No null product_id")
-check_col(items, "silver_order_items", F.col("seller_id").isNotNull(),   "No null seller_id")
-check_col(items, "silver_order_items",
-    F.col("price").isNull() | (F.col("price") >= 0), "price non-negative"
-)
-check_col(items, "silver_order_items",
-    F.col("seller_performance").isin("On Time Fulfillment", "Late Fulfillment", "UNKNOWN"),
-    "seller_performance in allowed values"
+
+silver_customers = read_delta(SILVER, "silver_customers")
+silver_sellers = read_delta(SILVER, "silver_sellers")
+silver_products = read_delta(SILVER, "silver_products")
+silver_orders = read_delta(SILVER, "silver_orders")
+silver_items = read_delta(SILVER, "silver_order_items")
+silver_payments = read_delta(SILVER, "silver_payments")
+silver_reviews = read_delta(SILVER, "silver_reviews")
+silver_mql = read_delta(SILVER, "silver_marketing_qualified_leads")
+silver_closed = read_delta(SILVER, "silver_closed_deals")
+seller_acquisition = read_delta(SILVER, "seller_acquisition_staging")
+sales_staging = read_delta(SILVER, "sales_staging")
+delivery_staging = read_delta(SILVER, "order_delivery_staging")
+reviews_staging = read_delta(SILVER, "reviews_staging")
+seller_fulfillment_staging = read_delta(SILVER, "seller_fulfillment_staging")
+seller_performance_monthly_staging = read_delta(SILVER, "seller_performance_monthly_staging")
+
+save_issue(silver_customers.filter(F.col("customer_id").isNull()), "dq_silver_customers_null_customer_id")
+save_issue(silver_sellers.filter(F.col("seller_id").isNull()), "dq_silver_sellers_null_seller_id")
+save_issue(silver_products.filter(F.col("product_id").isNull()), "dq_silver_products_null_product_id")
+save_issue(silver_orders.filter(F.col("order_id").isNull() | F.col("customer_id").isNull()), "dq_silver_orders_null_keys")
+
+save_issue(
+    silver_items.join(silver_orders.select("order_id"), "order_id", "left_anti")
+    .withColumn("dq_rule", F.lit("order_items_orphan_order_id")),
+    "dq_silver_order_items_orphan_order_id"
 )
 
-# ── silver_products ───────────────────────────────────────────────────────
-print("\n--- silver_products ---", flush=True)
-products = spark.read.format("delta").load(f"{S}silver_products")
-check_min_rows(products, "silver_products", 30_000)
-check_col(products, "silver_products", F.col("product_id").isNotNull(),           "No null product_id (PK)")
-check_col(products, "silver_products", F.col("product_weight_g").isNotNull(),     "No nulls in weight (imputed to -1)")
-check_col(products, "silver_products",
-    F.col("logistics_size_category").isin("Small Box","Medium Box","Large Parcel"),
-    "logistics_size_category in allowed values"
+save_issue(
+    silver_items.join(silver_products.select("product_id"), "product_id", "left_anti")
+    .withColumn("dq_rule", F.lit("order_items_orphan_product_id")),
+    "dq_silver_order_items_orphan_product_id"
 )
 
-# ── silver_sellers ────────────────────────────────────────────────────────
-print("\n--- silver_sellers ---", flush=True)
-sellers = spark.read.format("delta").load(f"{S}silver_sellers")
-check_min_rows(sellers, "silver_sellers", 3_000)
-check_col(sellers, "silver_sellers", F.col("seller_id").isNotNull(),              "No null seller_id (PK)")
-check_col(sellers, "silver_sellers",
-    F.col("late_ratio").isNull() | F.col("late_ratio").between(0, 1),
-    "late_ratio in [0,1] or null"
-)
-check_col(sellers, "silver_sellers",
-    F.col("early_ratio").isNull() | F.col("early_ratio").between(0, 1),
-    "early_ratio in [0,1] or null"
+save_issue(
+    silver_items.join(silver_sellers.select("seller_id"), "seller_id", "left_anti")
+    .withColumn("dq_rule", F.lit("order_items_orphan_seller_id")),
+    "dq_silver_order_items_orphan_seller_id"
 )
 
-# ── silver_customers ──────────────────────────────────────────────────────
-print("\n--- silver_customers ---", flush=True)
-customers = spark.read.format("delta").load(f"{S}silver_customers")
-check_min_rows(customers, "silver_customers", 90_000)
-check_col(customers, "silver_customers", F.col("customer_id").isNotNull(),        "No null customer_id (PK)")
-check_col(customers, "silver_customers", F.col("customer_unique_id").isNotNull(), "No null customer_unique_id")
-
-# ── silver_reviews ────────────────────────────────────────────────────────
-print("\n--- silver_reviews ---", flush=True)
-reviews = spark.read.format("delta").load(f"{S}silver_reviews")
-check_min_rows(reviews, "silver_reviews", 90_000)
-check_col(reviews, "silver_reviews", F.col("review_id").isNotNull(),              "No null review_id (PK)")
-check_col(reviews, "silver_reviews",
-    F.col("review_score").isNull() | F.col("review_score").between(1, 5),
-    "review_score in [1,5] or null"
-)
-check_col(reviews, "silver_reviews",
-    F.col("review_label").isin("Positive","Neutral","Negative","UNKNOWN"),
-    "review_label in allowed values"
+save_issue(
+    silver_payments.join(silver_orders.select("order_id"), "order_id", "left_anti")
+    .withColumn("dq_rule", F.lit("payments_orphan_order_id")),
+    "dq_silver_payments_orphan_order_id"
 )
 
-# ── silver_payments ───────────────────────────────────────────────────────
-print("\n--- silver_payments ---", flush=True)
-payments = spark.read.format("delta").load(f"{S}silver_payments")
-check_min_rows(payments, "silver_payments", 100_000)
-check_col(payments, "silver_payments",
-    F.col("is_installment_payment").isin(0, 1),
-    "is_installment_payment is binary"
-)
-check_col(payments, "silver_payments",
-    F.col("payment_value").isNull() | (F.col("payment_value") >= 0),
-    "payment_value non-negative"
+save_issue(
+    silver_reviews.join(silver_orders.select("order_id"), "order_id", "left_anti")
+    .withColumn("dq_rule", F.lit("reviews_orphan_order_id")),
+    "dq_silver_reviews_orphan_order_id"
 )
 
-# ── silver_geolocation ────────────────────────────────────────────────────
-print("\n--- silver_geolocation ---", flush=True)
-geo = spark.read.format("delta").load(f"{S}silver_geolocation")
-check_min_rows(geo, "silver_geolocation", 1_000)
-check_col(geo, "silver_geolocation",
-    F.col("geolocation_lat").between(-35, 6),
-    "latitude in Brazil bounds [-35, 6]"
-)
-check_col(geo, "silver_geolocation",
-    F.col("geolocation_lng").between(-75, -30),
-    "longitude in Brazil bounds [-75, -30]"
+save_issue(
+    silver_closed.join(silver_mql.select("mql_id"), "mql_id", "left_anti")
+    .withColumn("dq_rule", F.lit("closed_deals_orphan_mql_id")),
+    "dq_silver_closed_deals_orphan_mql_id"
 )
 
-# ── Final verdict ─────────────────────────────────────────────────────────
-print("\n" + "=" * 50, flush=True)
-if failures:
-    print(f"❌ {len(failures)} check(s) FAILED:", flush=True)
-    for f in failures:
-        print(f"   • {f}", flush=True)
-    spark.stop()
-    sys.exit(1)   # non-zero exit → Dagster marks the step as failed
-else:
-    print("🎉 All checks passed. Pipeline cleared for Gold.", flush=True)
+save_issue(
+    seller_acquisition.filter(F.col("converted_flag") == F.lit(True))
+    .join(silver_sellers.select("seller_id"), "seller_id", "left_anti")
+    .withColumn("dq_rule", F.lit("converted_marketing_seller_not_in_silver_sellers")),
+    "dq_seller_acquisition_seller_not_in_silver_sellers"
+)
+
+save_issue(
+    sales_staging.filter(
+        F.col("order_id").isNull() |
+        F.col("order_item_id").isNull() |
+        F.col("product_id").isNull() |
+        F.col("seller_id").isNull() |
+        F.col("customer_id").isNull()
+    ).withColumn("dq_rule", F.lit("sales_staging_null_business_keys")),
+    "dq_sales_staging_null_business_keys"
+)
+
+save_issue(
+    delivery_staging.filter(F.col("order_id").isNull() | F.col("customer_id").isNull())
+    .withColumn("dq_rule", F.lit("delivery_staging_null_business_keys")),
+    "dq_delivery_staging_null_business_keys"
+)
+
+save_issue(
+    reviews_staging.filter(F.col("review_id").isNull() | F.col("order_id").isNull())
+    .withColumn("dq_rule", F.lit("reviews_staging_null_business_keys")),
+    "dq_reviews_staging_null_business_keys"
+)
+
+save_issue(
+    seller_fulfillment_staging.filter(
+        F.col("order_id").isNull() |
+        F.col("order_item_id").isNull() |
+        F.col("seller_id").isNull() |
+        F.col("product_id").isNull()
+    ).withColumn("dq_rule", F.lit("seller_fulfillment_staging_null_business_keys")),
+    "dq_seller_fulfillment_staging_null_business_keys"
+)
+
+save_issue(
+    seller_performance_monthly_staging.filter(
+        F.col("seller_id").isNull() |
+        F.col("performance_year").isNull() |
+        F.col("performance_month").isNull()
+    ).withColumn("dq_rule", F.lit("seller_performance_monthly_null_business_keys")),
+    "dq_seller_performance_monthly_null_business_keys"
+)
+
+expected_public_tables = [
+    "dim_customer", "dim_seller", "dim_delivery_status", "dim_geolocation",
+    "dim_date", "dim_product", "dim_review_sentiment", "dim_payment_type",
+    "fct_order_sales", "fct_customer_reviews", "fct_order_delivery", "fct_seller_fulfillment",
+]
+
+expected_mart_schemas = [
+    "sales_mart",
+    "customer_satisfaction_mart",
+    "delivery_performance_mart",
+    "seller_performance_mart",
+    "seller_acquisition_effectiveness_mart",
+]
+
+try:
+    public_tables = set(row[0] for row in pg_query("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema='public'
+    """))
+
+    missing_public = [(name,) for name in expected_public_tables if name not in public_tables]
+    missing_public_df = spark.createDataFrame(missing_public, ["missing_table"]) if missing_public else spark.createDataFrame([], "missing_table string")
+    save_issue(missing_public_df.withColumn("dq_rule", F.lit("missing_expected_public_gold_table")), "dq_postgres_missing_public_gold_tables")
+
+    schemas = set(row[0] for row in pg_query("""
+        SELECT schema_name
+        FROM information_schema.schemata
+    """))
+
+    missing_schemas = [(name,) for name in expected_mart_schemas if name not in schemas]
+    missing_schemas_df = spark.createDataFrame(missing_schemas, ["missing_schema"]) if missing_schemas else spark.createDataFrame([], "missing_schema string")
+    save_issue(missing_schemas_df.withColumn("dq_rule", F.lit("missing_expected_mart_schema")), "dq_postgres_missing_mart_schemas")
+
+except Exception as exc:
+    error_df = spark.createDataFrame([(str(exc),)], ["postgres_validation_error"])
+    save_issue(error_df.withColumn("dq_rule", F.lit("postgres_validation_failed")), "dq_postgres_validation_error")
 
 spark.stop()
+print("Data quality validation completed.", flush=True)

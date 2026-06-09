@@ -1,649 +1,367 @@
-"""
-aggregate_gold.py - Olist Gold Layer ETL
-Compatible with the latest transform_silver.py output paths:
-  s3a://silver/silver_orders
-  s3a://silver/silver_order_items
-  s3a://silver/silver_products
-  s3a://silver/silver_customers
-  s3a://silver/silver_payments
-  s3a://silver/silver_sellers
-  s3a://silver/silver_geolocation
-  s3a://silver/silver_reviews
-
-Important compatibility decisions:
-- Does NOT expect has_sales in silver_sellers.
-- Does NOT expect on_time_flag in silver_orders.
-- Keeps latest Silver delivery_status_detail as-is.
-- Keeps latest Silver review_label as-is: Satisfied / Neutral / Unsatisfied.
-- Uses geolocation as a lookup to enrich customer/seller dimensions.
-- Adds Unknown (-1) rows in dimensions and coalesces missing FK lookups to -1.
-- Drops previous PostgreSQL Gold tables with CASCADE before reloading to avoid old FK constraint conflicts.
-"""
-
 from datetime import datetime, timedelta
-from decimal import Decimal
-
 import psycopg2
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    IntegerType, DecimalType, StructType, StructField, StringType,
-    TimestampType, LongType, DoubleType, BooleanType
-)
+from pyspark.sql.window import Window
+from pyspark.sql.types import IntegerType, StringType, DateType
+from delta import configure_spark_with_delta_pip
 
-# ============================================================
-# SPARK SETUP
-# ============================================================
+SILVER = "s3a://silver/"
+GOLD = "s3a://gold/"
+PG_URL = "jdbc:postgresql://postgres-dw:5432/olist_dw"
+PG_PROPS = {"user": "olist", "password": "olist", "driver": "org.postgresql.Driver"}
 
-spark = (SparkSession.builder
-    .appName("olist-gold-etl-final-compatible")
+FINAL_GOLD_TABLES = [
+    "dim_customer",
+    "dim_seller",
+    "dim_delivery_status",
+    "dim_geolocation",
+    "dim_date",
+    "dim_product",
+    "dim_review_sentiment",
+    "dim_payment_type",
+    "fct_order_sales",
+    "fct_customer_reviews",
+    "fct_order_delivery",
+    "fct_seller_fulfillment",
+]
+
+OLD_PUBLIC_TABLES = [
+    "seller_acquisition_effectiveness_mart",
+    "seller_performance_mart",
+    "delivery_performance_mart",
+    "customer_satisfaction_mart",
+    "sales_mart",
+    "dim_seller_enriched",
+    "fct_marketing_funnel",
+    "dim_business_segment",
+    "dim_marketing_channel",
+    "fct_customer_payment",
+    "fct_customer_review",
+    "fct_orders",
+    "dim_order_status_detail",
+]
+
+MART_SCHEMAS = [
+    "sales_mart",
+    "delivery_performance_mart",
+    "customer_satisfaction_mart",
+    "seller_performance_mart",
+    "seller_acquisition_effectiveness_mart",
+]
+
+builder = (
+    SparkSession.builder
+    .appName("olist_gold_aggregate")
     .master("spark://spark-master:7077")
     .config("spark.jars.packages", "org.postgresql:postgresql:42.7.2")
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
     .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
     .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
     .config("spark.hadoop.fs.s3a.secret.key", "minioadmin")
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.sql.shuffle.partitions", "4")
-    .getOrCreate())
+)
 
+spark = configure_spark_with_delta_pip(builder).getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
-PG_URL = "jdbc:postgresql://postgres-dw:5432/olist_dw"
-PG_PROPS = {"user": "olist", "password": "olist", "driver": "org.postgresql.Driver"}
-SILVER = "s3a://silver/"
-GOLD = "s3a://gold/"
-
-GOLD_TABLES = [
-    "fct_customer_review",
-    "fct_customer_payment",
-    "fct_seller_fulfillment",
-    "fct_orders",
-    "dim_order_status_detail",
-    "dim_seller",
-    "dim_product",
-    "dim_customer",
-    "dim_date",
-]
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def reset_postgres_gold_tables():
-    """Drop old Gold tables and constraints before Spark JDBC overwrite."""
-    print("\nResetting PostgreSQL Gold tables if they already exist...", flush=True)
+def pg_exec(statements):
     conn = psycopg2.connect(host="postgres-dw", port=5432, dbname="olist_dw", user="olist", password="olist")
     conn.autocommit = True
     cur = conn.cursor()
-    for table in GOLD_TABLES:
-        try:
-            cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-            print(f"   dropped/cleared {table}", flush=True)
-        except Exception as e:
-            print(f"   warning while dropping {table}: {str(e)[:120]}", flush=True)
+    for stmt in statements:
+        cur.execute(stmt)
     cur.close()
     conn.close()
 
+def reset_postgres():
+    statements = []
+    for schema in MART_SCHEMAS:
+        statements.append(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    for table in OLD_PUBLIC_TABLES + FINAL_GOLD_TABLES:
+        statements.append(f"DROP TABLE IF EXISTS public.{table} CASCADE")
+    pg_exec(statements)
 
-def save_to_gold(df, table_name):
-    print(f"   Saving {table_name} to MinIO Gold...", flush=True)
-    (df.write.format("delta")
-       .mode("overwrite")
-       .option("overwriteSchema", "true")
-       .save(f"{GOLD}{table_name}"))
+def read_silver(name):
+    return spark.read.format("delta").load(f"{SILVER}{name}")
 
-    print(f"   Saving {table_name} to PostgreSQL...", flush=True)
-    (df.write.jdbc(url=PG_URL, table=table_name, mode="overwrite", properties=PG_PROPS))
-    print(f"   {table_name} saved ({df.count():,} rows)", flush=True)
+def save_gold(df, table):
+    df.cache()
+    row_count = df.count()
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(f"{GOLD}{table}")
+    df.write.jdbc(url=PG_URL, table=f"public.{table}", mode="overwrite", properties=PG_PROPS)
+    df.unpersist()
+    print(f"Saved {table}. Rows: {row_count}", flush=True)
 
+def date_sk(ts_col):
+    return F.when(F.col(ts_col).isNotNull(), F.date_format(F.col(ts_col), "yyyyMMdd").cast(IntegerType())).otherwise(F.lit(None).cast(IntegerType()))
 
-def add_unknown_row(df, sk_column, unknown_values):
-    """Add one Unknown row with SK = -1 to a dimension table."""
-    row_values = []
-    for field in df.schema.fields:
-        col_name = field.name
-        data_type = field.dataType
+reset_postgres()
 
-        if col_name == sk_column:
-            row_values.append(-1)
-        elif col_name in unknown_values:
-            val = unknown_values[col_name]
-            if val is None:
-                row_values.append(None)
-            elif isinstance(data_type, DoubleType):
-                row_values.append(float(val))
-            elif isinstance(data_type, DecimalType):
-                row_values.append(Decimal(str(val)))
-            elif isinstance(data_type, (IntegerType, LongType)):
-                row_values.append(int(val))
-            elif isinstance(data_type, StringType):
-                row_values.append(str(val))
-            elif isinstance(data_type, TimestampType):
-                row_values.append(val if val else datetime.now())
-            elif isinstance(data_type, BooleanType):
-                row_values.append(bool(val))
-            else:
-                row_values.append(val)
-        elif isinstance(data_type, TimestampType):
-            row_values.append(datetime.now())
-        elif isinstance(data_type, StringType):
-            row_values.append("Unknown")
-        elif isinstance(data_type, (IntegerType, LongType)):
-            row_values.append(-1)
-        elif isinstance(data_type, DoubleType):
-            row_values.append(-1.0)
-        elif isinstance(data_type, DecimalType):
-            row_values.append(Decimal("-1.0"))
-        elif isinstance(data_type, BooleanType):
-            row_values.append(False)
-        else:
-            row_values.append(None)
+silver_customers = read_silver("silver_customers")
+silver_sellers = read_silver("silver_sellers")
+silver_products = read_silver("silver_products")
+silver_geo = read_silver("silver_geolocation")
+sales_staging = read_silver("sales_staging")
+delivery_staging = read_silver("order_delivery_staging")
+reviews_staging = read_silver("reviews_staging")
+fulfillment_staging = read_silver("seller_fulfillment_staging")
 
-    unknown_df = spark.createDataFrame([tuple(row_values)], schema=df.schema)
-    return df.unionByName(unknown_df)
-
-
-def cast_existing_timestamps(df, cols):
-    """Defensive only. Silver already casts timestamps, but this keeps Gold safe."""
-    for c in cols:
-        if c in df.columns:
-            df = df.withColumn(c, F.col(c).cast(TimestampType()))
-    return df
-
-
-def date_sk_from_timestamp(col_name):
-    return F.when(
-        F.col(col_name).isNotNull(),
-        F.date_format(F.col(col_name), "yyyyMMdd").cast(IntegerType())
-    ).otherwise(F.lit(19000101).cast(IntegerType()))
-
-
-# ============================================================
-# START
-# ============================================================
-
-print("\n" + "=" * 60)
-print("LOADING SILVER TABLES")
-print("=" * 60)
-
-reset_postgres_gold_tables()
-
-silver_orders = spark.read.format("delta").load(f"{SILVER}silver_orders")
-silver_order_items = spark.read.format("delta").load(f"{SILVER}silver_order_items")
-silver_customers = spark.read.format("delta").load(f"{SILVER}silver_customers")
-silver_products = spark.read.format("delta").load(f"{SILVER}silver_products")
-silver_sellers = spark.read.format("delta").load(f"{SILVER}silver_sellers")
-silver_payments = spark.read.format("delta").load(f"{SILVER}silver_payments")
-silver_reviews = spark.read.format("delta").load(f"{SILVER}silver_reviews")
-silver_geolocation = spark.read.format("delta").load(f"{SILVER}silver_geolocation")
-
-# Defensive timestamp casting. Does not change Silver business labels/metrics.
-silver_orders = cast_existing_timestamps(silver_orders, [
-    "order_purchase_timestamp",
-    "order_approved_at",
-    "order_delivered_carrier_date",
-    "order_delivered_customer_date",
-    "order_estimated_delivery_date",
-])
-silver_order_items = cast_existing_timestamps(silver_order_items, ["shipping_limit_date"])
-silver_reviews = cast_existing_timestamps(silver_reviews, ["review_creation_date", "review_answer_timestamp"])
-
-print("✅ All Silver tables loaded", flush=True)
-
-
-# ============================================================
-# BUILD DIMENSIONS
-# ============================================================
-
-print("\n" + "=" * 60)
-print("BUILDING DIMENSION TABLES")
-print("=" * 60)
-
-# ------------------------------------------------------------
-# 1. DIM_DATE
-# ------------------------------------------------------------
-print("\n📅 Building dim_date...", flush=True)
-
-date_data = []
-current = datetime(2016, 1, 1)
-end_date = datetime(2025, 12, 31)
-while current <= end_date:
-    year = current.year
-    month = current.month
-    day = current.day
-    next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
-    last_day_of_month = (next_month - timedelta(days=1)).day
-    date_data.append((
+date_rows = []
+current = datetime(2015, 1, 1)
+end = datetime(2020, 12, 31)
+while current <= end:
+    date_rows.append((
         int(current.strftime("%Y%m%d")),
-        current.strftime("%Y-%m-%d"),
-        day,
-        current.strftime("%A"),
-        int(current.strftime("%W")),
-        month,
+        current.date(),
+        current.year,
+        ((current.month - 1) // 3) + 1,
+        current.month,
+        f"{current.month:02d}",
         current.strftime("%B"),
-        (month - 1) // 3 + 1,
-        year,
-        1 if current.weekday() >= 5 else 0,
-        1 if day == 1 else 0,
-        1 if day == last_day_of_month else 0,
+        current.strftime("%Y-%m"),
+        int(current.strftime("%U")),
+        current.day,
+        int(current.strftime("%j")),
+        current.strftime("%A"),
+        "Weekend" if current.weekday() >= 5 else "Business Day",
+        current.weekday() >= 5,
+        current.weekday() < 5,
+        current.day == 1,
+        (current + timedelta(days=1)).month != current.month,
+        current.month in [1, 4, 7, 10] and current.day == 1,
+        current.month in [3, 6, 9, 12] and ((current + timedelta(days=1)).month != current.month),
+        current.month == 1 and current.day == 1,
+        current.month == 12 and current.day == 31,
     ))
     current += timedelta(days=1)
 
-# Unknown / missing date row and far-future row.
-date_data.append((19000101, "1900-01-01", 1, "Monday", 1, 1, "January", 1, 1900, 0, 1, 0))
-date_data.append((29991231, "2999-12-31", 31, "Wednesday", 53, 12, "December", 4, 2999, 0, 0, 1))
+dim_date = spark.createDataFrame(date_rows, [
+    "date_sk", "full_date", "year", "quarter", "month", "month_key", "month_name", "year_month",
+    "week_of_year", "day", "day_of_year", "day_name", "day_type", "is_weekend", "is_business_day",
+    "is_month_start", "is_month_end", "is_quarter_start", "is_quarter_end", "is_year_start", "is_year_end"
+]).withColumn("gold_loaded_at", F.current_timestamp()).withColumn("source_system", F.lit("OLIST")).withColumn("transformation_version", F.lit("1.0"))
 
-date_schema = StructType([
-    StructField("date_sk", IntegerType(), True),
-    StructField("full_date", StringType(), True),
-    StructField("day_number", IntegerType(), True),
-    StructField("day_name", StringType(), True),
-    StructField("week_number", IntegerType(), True),
-    StructField("month_number", IntegerType(), True),
-    StructField("month_name", StringType(), True),
-    StructField("quarter_number", IntegerType(), True),
-    StructField("year_number", IntegerType(), True),
-    StructField("is_weekend", IntegerType(), True),
-    StructField("is_month_start", IntegerType(), True),
-    StructField("is_month_end", IntegerType(), True),
-])
-
-dim_date = spark.createDataFrame(date_data, schema=date_schema)
-save_to_gold(dim_date, "dim_date")
-
-# ------------------------------------------------------------
-# 2. DIM_CUSTOMER
-# ------------------------------------------------------------
-print("\n👤 Building dim_customer...", flush=True)
-
-geo_lookup_customer = (
-    silver_geolocation
-    .groupBy("geolocation_zip_code_prefix")
-    .agg(
-        F.avg("geolocation_lat").alias("customer_latitude"),
-        F.avg("geolocation_lng").alias("customer_longitude"),
-    )
-    .select(
-        F.col("geolocation_zip_code_prefix").alias("zip_prefix"),
-        "customer_latitude",
-        "customer_longitude",
-    )
+dim_geolocation = (
+    silver_geo
+    .withColumn("geolocation_sk", F.row_number().over(Window.orderBy("zip_code_prefix", "city", "state")))
+    .select("geolocation_sk", "zip_code_prefix", "city", "state", "region", "median_latitude", "median_longitude", "source_system", "transformation_version")
+    .withColumn("gold_loaded_at", F.current_timestamp())
 )
 
 dim_customer = (
     silver_customers
-    .join(geo_lookup_customer, silver_customers.customer_zip_code_prefix == geo_lookup_customer.zip_prefix, "left")
-    .drop("zip_prefix")
-    .select(
-        "customer_id", "customer_unique_id", "customer_zip_code_prefix",
-        "customer_city", "customer_state", "customer_region",
-        "customer_latitude", "customer_longitude",
-    )
-    .dropDuplicates(["customer_id"])
-    .withColumn("customer_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
-)
-
-dim_customer = add_unknown_row(dim_customer, "customer_sk", {
-    "customer_id": "-1",
-    "customer_unique_id": "-1",
-    "customer_zip_code_prefix": -1,
-    "customer_city": "Unknown",
-    "customer_state": "Unknown",
-    "customer_region": "Unknown",
-    "customer_latitude": -1.0,
-    "customer_longitude": -1.0,
-})
-save_to_gold(dim_customer, "dim_customer")
-
-# ------------------------------------------------------------
-# 3. DIM_PRODUCT
-# ------------------------------------------------------------
-print("\n📦 Building dim_product...", flush=True)
-
-product_cols = [
-    "product_id", "product_category_name", "product_name_lenght", "product_description_lenght",
-    "product_photos_qty", "product_weight_g", "product_length_cm", "product_height_cm",
-    "product_width_cm", "product_size_cm3", "logistics_size_category", "logistics_weight_category",
-]
-product_cols = [c for c in product_cols if c in silver_products.columns]
-
-dim_product = (
-    silver_products
-    .select(product_cols)
-    .dropDuplicates(["product_id"])
-    .withColumn("product_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
-)
-
-dim_product = add_unknown_row(dim_product, "product_sk", {
-    "product_id": "-1",
-    "product_category_name": "Unknown",
-    "product_name_lenght": -1,
-    "product_description_lenght": -1,
-    "product_photos_qty": -1,
-    "product_weight_g": -1.0,
-    "product_length_cm": -1.0,
-    "product_height_cm": -1.0,
-    "product_width_cm": -1.0,
-    "product_size_cm3": -1.0,
-    "logistics_size_category": "Unknown",
-    "logistics_weight_category": "Unknown",
-})
-save_to_gold(dim_product, "dim_product")
-
-# ------------------------------------------------------------
-# 4. DIM_SELLER
-# ------------------------------------------------------------
-print("\n🏪 Building dim_seller...", flush=True)
-
-geo_lookup_seller = (
-    silver_geolocation
-    .groupBy("geolocation_zip_code_prefix")
-    .agg(
-        F.avg("geolocation_lat").alias("seller_latitude"),
-        F.avg("geolocation_lng").alias("seller_longitude"),
-    )
-    .select(
-        F.col("geolocation_zip_code_prefix").alias("zip_prefix"),
-        "seller_latitude",
-        "seller_longitude",
-    )
+    .withColumn("customer_location_type",
+        F.when(F.col("customer_city").isin("sao paulo", "rio de janeiro", "brasilia", "salvador", "fortaleza", "belo horizonte", "curitiba", "manaus", "recife", "porto alegre"), "Metropolitan")
+         .when(F.col("customer_state").isin("SP", "RJ", "MG"), "Urban")
+         .otherwise("Regional"))
+    .withColumn("customer_sk", F.row_number().over(Window.orderBy("customer_id")))
+    .select("customer_sk", "customer_id", "customer_unique_id", "customer_zip_code_prefix", "customer_city", "customer_state",
+            "customer_region", "customer_location_type", "median_latitude", "median_longitude", "source_system", "transformation_version")
+    .withColumn("gold_loaded_at", F.current_timestamp())
 )
 
 dim_seller = (
     silver_sellers
-    .join(geo_lookup_seller, silver_sellers.seller_zip_code_prefix == geo_lookup_seller.zip_prefix, "left")
-    .drop("zip_prefix")
+    .withColumn("seller_location_type",
+        F.when(F.col("seller_city").isin("sao paulo", "rio de janeiro", "brasilia", "salvador", "fortaleza", "belo horizonte", "curitiba", "manaus", "recife", "porto alegre"), "Metropolitan")
+         .when(F.col("seller_state").isin("SP", "RJ", "MG"), "Urban")
+         .otherwise("Regional"))
+    .withColumn("effective_start_date", F.current_date())
+    .withColumn("effective_end_date", F.lit(None).cast(DateType()))
+    .withColumn("is_current", F.lit(True))
+    .withColumn("seller_sk", F.row_number().over(Window.orderBy("seller_id")))
+    .select("seller_sk", "seller_id", "seller_zip_code_prefix", "seller_city", "seller_state", "seller_region",
+            "median_latitude", "median_longitude", "marketing_origin", "acquisition_source", "business_segment",
+            "lead_type", "lead_behaviour_profile", "days_to_convert", "converted_flag", "seller_acquisition_segment",
+            "seller_location_type", "effective_start_date", "effective_end_date", "is_current", "source_system", "transformation_version")
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+dim_product = (
+    silver_products
+    .withColumn("product_sk", F.row_number().over(Window.orderBy("product_id")))
+    .select("product_sk", "product_id", "product_category_name", "product_category_name_english", "product_name_lenght",
+            "product_description_lenght", "product_photos_qty", "product_weight_g", "product_length_cm", "product_height_cm",
+            "product_width_cm", "product_volume_cm3", "product_size_category", "heavy_product_flag",
+            "logistics_completeness_flag", "catalog_completeness_flag", "source_system", "transformation_version")
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+dim_delivery_status = (
+    delivery_staging.select("delivery_status_category", "order_status").dropDuplicates()
+    .withColumn("delivery_status_sk", F.row_number().over(Window.orderBy("delivery_status_category", "order_status")))
+    .withColumn("delivery_status_group",
+        F.when(F.col("delivery_status_category") == "On Time", "Successful")
+         .when(F.col("delivery_status_category").isin("Slight Delay", "Late", "Critical Delay"), "Delayed")
+         .otherwise("Other"))
+    .select("delivery_status_sk", "order_status", "delivery_status_category", "delivery_status_group")
+    .withColumn("source_system", F.lit("OLIST"))
+    .withColumn("transformation_version", F.lit("1.0"))
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+dim_review_sentiment = (
+    reviews_staging.select("sentiment_category").dropDuplicates()
+    .withColumn("review_sentiment_sk", F.row_number().over(Window.orderBy("sentiment_category")))
+    .withColumn("sentiment_score_band",
+        F.when(F.col("sentiment_category") == "Positive", "Score 4-5")
+         .when(F.col("sentiment_category") == "Neutral", "Score 3")
+         .when(F.col("sentiment_category") == "Negative", "Score 1-2")
+         .otherwise("Unknown"))
+    .select("review_sentiment_sk", "sentiment_category", "sentiment_score_band")
+    .withColumn("source_system", F.lit("OLIST"))
+    .withColumn("transformation_version", F.lit("1.0"))
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+dim_payment_type = (
+    sales_staging.select("payment_type", "payment_type_category", "installment_flag").dropDuplicates()
+    .withColumn("payment_type_sk", F.row_number().over(Window.orderBy("payment_type", "installment_flag")))
+    .select("payment_type_sk", "payment_type", "payment_type_category", "installment_flag")
+    .withColumn("source_system", F.lit("OLIST"))
+    .withColumn("transformation_version", F.lit("1.0"))
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+for name, df in [
+    ("dim_date", dim_date), ("dim_geolocation", dim_geolocation), ("dim_customer", dim_customer),
+    ("dim_seller", dim_seller), ("dim_product", dim_product), ("dim_delivery_status", dim_delivery_status),
+    ("dim_review_sentiment", dim_review_sentiment), ("dim_payment_type", dim_payment_type)
+]:
+    save_gold(df, name)
+
+dim_customer_pg = spark.read.jdbc(url=PG_URL, table="public.dim_customer", properties=PG_PROPS)
+dim_seller_pg = spark.read.jdbc(url=PG_URL, table="public.dim_seller", properties=PG_PROPS)
+dim_product_pg = spark.read.jdbc(url=PG_URL, table="public.dim_product", properties=PG_PROPS)
+dim_delivery_status_pg = spark.read.jdbc(url=PG_URL, table="public.dim_delivery_status", properties=PG_PROPS)
+dim_review_sentiment_pg = spark.read.jdbc(url=PG_URL, table="public.dim_review_sentiment", properties=PG_PROPS)
+dim_payment_type_pg = spark.read.jdbc(url=PG_URL, table="public.dim_payment_type", properties=PG_PROPS)
+
+fct_order_sales = (
+    sales_staging
+    .join(dim_product_pg.select("product_id", "product_sk"), "product_id", "left")
+    .join(dim_seller_pg.select("seller_id", "seller_sk"), "seller_id", "left")
+    .join(dim_customer_pg.select("customer_id", "customer_sk"), "customer_id", "left")
+    .join(dim_payment_type_pg.select("payment_type", "installment_flag", "payment_type_sk"), ["payment_type", "installment_flag"], "left")
+    .withColumn("sales_date_sk", date_sk("order_purchase_timestamp"))
+    .withColumn("high_freight_item_flag", F.col("freight_ratio") > 0.30)
+    .withColumn("sales_fact_sk", F.row_number().over(Window.orderBy("order_id", "order_item_id")))
     .select(
-        "seller_id", "seller_zip_code_prefix", "seller_city", "seller_state", "seller_region",
-        "total_items_sold", "total_unique_orders", "early_preparations", "on_time_preparations",
-        "late_preparations", "avg_handling_days", "early_ratio", "on_time_ratio", "late_ratio",
-        "seller_latitude", "seller_longitude",
+        "sales_fact_sk", "order_id", "order_item_id",
+        F.col("product_sk").alias("product_sk_fk"), F.col("seller_sk").alias("seller_sk_fk"),
+        F.col("customer_sk").alias("customer_sk_fk"), F.col("payment_type_sk").alias("payment_type_sk_fk"),
+        "sales_date_sk", "price", "freight_value", "gross_item_value", "total_order_item_value",
+        "allocated_payment_value", "item_sales_ratio", "freight_ratio", "product_volume_cm3",
+        "seller_item_count_in_order", "total_payment_installments", "installment_flag",
+        "high_ticket_order_flag", "high_freight_item_flag", "source_system", "transformation_version"
     )
-    .dropDuplicates(["seller_id"])
-    .withColumn("seller_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
+    .withColumn("gold_loaded_at", F.current_timestamp())
 )
 
-dim_seller = add_unknown_row(dim_seller, "seller_sk", {
-    "seller_id": "-1",
-    "seller_zip_code_prefix": -1,
-    "seller_city": "Unknown",
-    "seller_state": "Unknown",
-    "seller_region": "Unknown",
-    "total_items_sold": 0,
-    "total_unique_orders": 0,
-    "early_preparations": 0,
-    "on_time_preparations": 0,
-    "late_preparations": 0,
-    "avg_handling_days": 0.0,
-    "early_ratio": 0.0,
-    "on_time_ratio": 0.0,
-    "late_ratio": 0.0,
-    "seller_latitude": -1.0,
-    "seller_longitude": -1.0,
-})
-save_to_gold(dim_seller, "dim_seller")
-
-# ------------------------------------------------------------
-# 5. DIM_ORDER_STATUS_DETAIL
-# ------------------------------------------------------------
-print("\n📊 Building dim_order_status_detail...", flush=True)
-
-dim_order_status = (
-    silver_orders
-    .select("order_status", "delivery_status_detail")
-    .dropDuplicates(["order_status", "delivery_status_detail"])
-    .withColumn("status_sk", F.monotonically_increasing_id() + 1)
-)
-
-dim_order_status = add_unknown_row(dim_order_status, "status_sk", {
-    "order_status": "Unknown",
-    "delivery_status_detail": "Unknown",
-})
-save_to_gold(dim_order_status, "dim_order_status_detail")
-
-
-# ============================================================
-# RELOAD DIMENSIONS FROM POSTGRESQL
-# ============================================================
-print("\n" + "=" * 60)
-print("RELOADING DIMENSIONS FROM POSTGRESQL")
-print("=" * 60)
-
-dim_customer_pg = spark.read.jdbc(url=PG_URL, table="dim_customer", properties=PG_PROPS)
-dim_product_pg = spark.read.jdbc(url=PG_URL, table="dim_product", properties=PG_PROPS)
-dim_seller_pg = spark.read.jdbc(url=PG_URL, table="dim_seller", properties=PG_PROPS)
-dim_status_pg = spark.read.jdbc(url=PG_URL, table="dim_order_status_detail", properties=PG_PROPS)
-
-print("✅ Dimensions reloaded", flush=True)
-
-
-# ============================================================
-# BUILD FACTS
-# ============================================================
-print("\n" + "=" * 60)
-print("BUILDING FACT TABLES")
-print("=" * 60)
-
-# ------------------------------------------------------------
-# 6. FCT_ORDERS
-# ------------------------------------------------------------
-print("\n📋 Building fct_orders...", flush=True)
-
-customer_lookup = dim_customer_pg.select(F.col("customer_sk"), F.col("customer_id").alias("cid"))
-status_lookup = dim_status_pg.select(
-    F.col("status_sk"),
-    F.col("order_status").alias("os"),
-    F.col("delivery_status_detail").alias("dsd"),
-)
-
-fct_orders = (
-    silver_orders.alias("so")
-    .join(customer_lookup, F.col("so.customer_id") == F.col("cid"), "left")
-    .drop("cid")
-    .join(status_lookup,
-          (F.col("so.order_status") == F.col("os")) &
-          (F.col("so.delivery_status_detail") == F.col("dsd")),
-          "left")
-    .drop("os", "dsd")
-    .withColumn("purchase_date_sk_fk", date_sk_from_timestamp("order_purchase_timestamp"))
-    .withColumn("estimated_delivery_date_sk_fk", date_sk_from_timestamp("order_estimated_delivery_date"))
-    .withColumn("actual_delivery_date_sk_fk", date_sk_from_timestamp("order_delivered_customer_date"))
+fct_order_delivery = (
+    delivery_staging
+    .join(dim_customer_pg.select("customer_id", "customer_sk"), "customer_id", "left")
+    .join(dim_seller_pg.select(F.col("seller_id").alias("primary_seller_id"), "seller_sk"), "primary_seller_id", "left")
+    .join(dim_delivery_status_pg.select("order_status", "delivery_status_category", "delivery_status_sk"), ["order_status", "delivery_status_category"], "left")
+    .withColumn("purchase_date_sk", date_sk("order_purchase_timestamp"))
+    .withColumn("estimated_delivery_date_sk", date_sk("order_estimated_delivery_date"))
+    .withColumn("actual_delivery_date_sk", date_sk("order_delivered_customer_date"))
+    .withColumn("on_time_delivery_flag", F.col("days_diff_estimated") <= 0)
+    .withColumn("late_delivery_flag", F.col("days_diff_estimated") > 0)
+    .withColumn("delivery_fact_sk", F.row_number().over(Window.orderBy("order_id")))
     .select(
-        "order_id",
-        F.coalesce(F.col("customer_sk"), F.lit(-1)).cast(LongType()).alias("customer_sk_fk"),
-        F.coalesce(F.col("status_sk"), F.lit(-1)).cast(LongType()).alias("status_sk_fk"),
-        "purchase_date_sk_fk",
-        "estimated_delivery_date_sk_fk",
-        "actual_delivery_date_sk_fk",
-        "order_status",
-        "order_purchase_timestamp",
-        "order_approved_at",
-        "order_delivered_carrier_date",
-        "order_delivered_customer_date",
-        "order_estimated_delivery_date",
-        "handling_days",
-        "shipping_days",
-        "total_lead_time",
-        "days_diff_estimated",
-        "estimated_buffer",
-        "delivery_status_detail",
-        "abs_days_diff",
-        "total_products_price",
-        "total_freight_value",
-        "total_order_cost",
-        "total_items_count",
-        "seller_count",
-        "is_multi_seller_order",
+        "delivery_fact_sk", "order_id", F.col("customer_sk").alias("customer_sk_fk"),
+        F.col("seller_sk").alias("seller_sk_fk"), F.col("delivery_status_sk").alias("delivery_status_sk_fk"),
+        "purchase_date_sk", "estimated_delivery_date_sk", "actual_delivery_date_sk",
+        "order_status", "order_purchase_timestamp", "order_approved_at", "order_delivered_carrier_date",
+        "order_delivered_customer_date", "order_estimated_delivery_date", F.col("total_lead_time").alias("delivery_duration_days"),
+        F.col("days_diff_estimated").alias("delay_days"), F.col("estimated_buffer").alias("buffer_days"), "freight_total_value", "total_items_count", "seller_count",
+        "is_multi_seller_order", "distance_bucket", "seller_region", "customer_region",
+        "on_time_delivery_flag", "late_delivery_flag", "source_system", "transformation_version"
     )
-    .withColumn("order_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
+    .withColumn("gold_loaded_at", F.current_timestamp())
 )
-save_to_gold(fct_orders, "fct_orders")
 
-# ------------------------------------------------------------
-# 7. FCT_SELLER_FULFILLMENT
-# ------------------------------------------------------------
-print("\n🚚 Building fct_seller_fulfillment...", flush=True)
-
-orders_for_fulfillment = silver_orders.select("order_id", "customer_id", "order_purchase_timestamp")
-product_lookup = dim_product_pg.select(F.col("product_sk"), F.col("product_id").alias("pid"))
-seller_lookup = dim_seller_pg.select(F.col("seller_sk"), F.col("seller_id").alias("sid"))
-customer_lookup_f = dim_customer_pg.select(F.col("customer_sk"), F.col("customer_id").alias("cid"))
-
-fct_fulfillment = (
-    silver_order_items.alias("oi")
-    .join(product_lookup, F.col("oi.product_id") == F.col("pid"), "left")
-    .join(seller_lookup, F.col("oi.seller_id") == F.col("sid"), "left")
-    .join(orders_for_fulfillment, "order_id", "left")
-    .join(customer_lookup_f, F.col("customer_id") == F.col("cid"), "left")
-    .drop("pid", "sid", "cid", "customer_id")
-    .withColumn("purchase_date_sk_fk", date_sk_from_timestamp("order_purchase_timestamp"))
-    .withColumn("shipping_limit_date_sk_fk", date_sk_from_timestamp("shipping_limit_date"))
+fct_customer_reviews = (
+    reviews_staging
+    .join(dim_seller_pg.select(F.col("seller_id").alias("primary_seller_id"), "seller_sk"), "primary_seller_id", "left")
+    .join(dim_review_sentiment_pg.select("sentiment_category", "review_sentiment_sk"), "sentiment_category", "left")
+    .withColumn("review_date_sk", date_sk("review_creation_date"))
+    .withColumn("response_date_sk", date_sk("review_answer_timestamp"))
+    .withColumn("low_rating_flag", F.col("review_score") <= 2)
+    .withColumn("excellent_rating_flag", F.col("review_score") == 5)
+    .withColumn("review_fact_sk", F.row_number().over(Window.orderBy("review_id")))
     .select(
-        "order_id",
-        "order_item_id",
-        F.coalesce(F.col("customer_sk"), F.lit(-1)).cast(LongType()).alias("customer_sk_fk"),
-        F.coalesce(F.col("product_sk"), F.lit(-1)).cast(LongType()).alias("product_sk_fk"),
-        F.coalesce(F.col("seller_sk"), F.lit(-1)).cast(LongType()).alias("seller_sk_fk"),
-        "purchase_date_sk_fk",
-        "shipping_limit_date_sk_fk",
-        "shipping_limit_date",
-        "price",
-        "freight_value",
-        "seller_handling_days",
-        "abs_seller_handling",
-        "seller_performance",
+        "review_fact_sk", "review_id", "order_id", F.col("seller_sk").alias("seller_sk_fk"),
+        F.col("review_sentiment_sk").alias("review_sentiment_sk_fk"), "review_date_sk", "response_date_sk",
+        "review_score", F.col("review_response_delay_days").alias("review_response_days"), "delivery_duration_days", "delay_days",
+        "negative_review_flag", "neutral_review_flag", "positive_review_flag",
+        "delayed_delivery_review_flag", "low_rating_flag", "excellent_rating_flag",
+        "is_multi_seller_order", "sentiment_category", "delivery_experience_segment",
+        "delivery_status_category", "distance_bucket", "source_system", "transformation_version"
     )
-    .withColumn("fulfillment_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
+    .withColumn("gold_loaded_at", F.current_timestamp())
 )
-save_to_gold(fct_fulfillment, "fct_seller_fulfillment")
 
-# ------------------------------------------------------------
-# 8. FCT_CUSTOMER_PAYMENT
-# ------------------------------------------------------------
-print("\n💰 Building fct_customer_payment...", flush=True)
-
-orders_for_payment = silver_orders.select("order_id", "customer_id")
-customer_lookup_p = dim_customer_pg.select(F.col("customer_sk"), F.col("customer_id").alias("cid"))
-
-fct_payment = (
-    silver_payments.alias("p")
-    .join(orders_for_payment, "order_id", "left")
-    .join(customer_lookup_p, F.col("customer_id") == F.col("cid"), "left")
-    .drop("cid", "customer_id")
+fct_seller_fulfillment = (
+    fulfillment_staging
+    .join(dim_seller_pg.select("seller_id", "seller_sk"), "seller_id", "left")
+    .join(dim_product_pg.select("product_id", "product_sk"), "product_id", "left")
+    .withColumn("purchase_date_sk", date_sk("order_purchase_timestamp"))
+    .withColumn("high_freight_item_flag", F.col("freight_ratio") >= 0.30)
+    .withColumn("high_workload_flag", F.col("workload_bucket").isin("High Volume", "Overloaded"))
+    .withColumn("fulfillment_fact_sk", F.row_number().over(Window.orderBy("order_id", "order_item_id")))
     .select(
-        "order_id",
-        F.coalesce(F.col("customer_sk"), F.lit(-1)).cast(LongType()).alias("customer_sk_fk"),
-        "payment_sequential",
-        "payment_type",
-        "payment_installments",
-        "payment_value",
-        "is_installment_payment",
+        "fulfillment_fact_sk", "order_id", "order_item_id",
+        F.col("seller_sk").alias("seller_sk_fk"), F.col("product_sk").alias("product_sk_fk"),
+        "purchase_date_sk", "price", "freight_value", "freight_ratio", "product_volume_cm3",
+        "seller_item_count_in_order", "seller_monthly_orders", "workload_bucket",
+        "is_overloaded_seller", "high_workload_flag", "high_freight_item_flag",
+        "acquisition_source", "source_system", "transformation_version"
     )
-    .withColumn("payment_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
+    .withColumn("gold_loaded_at", F.current_timestamp())
 )
-save_to_gold(fct_payment, "fct_customer_payment")
 
-# ------------------------------------------------------------
-# 9. FCT_CUSTOMER_REVIEW
-# ------------------------------------------------------------
-print("\n⭐ Building fct_customer_review...", flush=True)
+for name, df in [
+    ("fct_order_sales", fct_order_sales), ("fct_order_delivery", fct_order_delivery),
+    ("fct_customer_reviews", fct_customer_reviews), ("fct_seller_fulfillment", fct_seller_fulfillment)
+]:
+    save_gold(df, name)
 
-orders_for_review = silver_orders.select("order_id", "customer_id")
-customer_lookup_r = dim_customer_pg.select(F.col("customer_sk"), F.col("customer_id").alias("cid"))
-
-fct_review = (
-    silver_reviews.alias("r")
-    .join(orders_for_review, "order_id", "left")
-    .join(customer_lookup_r, F.col("customer_id") == F.col("cid"), "left")
-    .drop("cid", "customer_id")
-    .withColumn("review_creation_date_sk_fk", date_sk_from_timestamp("review_creation_date"))
-    .select(
-        "review_id",
-        "order_id",
-        F.coalesce(F.col("customer_sk"), F.lit(-1)).cast(LongType()).alias("customer_sk_fk"),
-        "review_creation_date_sk_fk",
-        "review_creation_date",
-        "review_answer_timestamp",
-        "review_score",
-        "review_label",
-        "review_response_delay_days",
-    )
-    .withColumn("review_sk", F.monotonically_increasing_id() + 1)
-    .withColumn("created_at", F.current_timestamp())
-)
-# Remove accidental duplicate review_id column if Spark preserves both names poorly.
-fct_review = fct_review.select(
-    "review_sk", "review_id", "order_id", "customer_sk_fk", "review_creation_date_sk_fk",
-    "review_creation_date", "review_answer_timestamp", "review_score", "review_label",
-    "review_response_delay_days", "created_at"
-)
-save_to_gold(fct_review, "fct_customer_review")
-
-
-# ============================================================
-# ADD PRIMARY AND FOREIGN KEY CONSTRAINTS
-# ============================================================
-print("\n" + "=" * 60)
-print("ADDING PRIMARY AND FOREIGN KEY CONSTRAINTS")
-print("=" * 60)
-
-try:
-    conn = psycopg2.connect(host="postgres-dw", port=5432, dbname="olist_dw", user="olist", password="olist")
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    print("  📌 Adding Primary Keys...", flush=True)
-    pks = [
-        "ALTER TABLE dim_customer ADD CONSTRAINT PK_dim_customer PRIMARY KEY (customer_sk)",
-        "ALTER TABLE dim_product ADD CONSTRAINT PK_dim_product PRIMARY KEY (product_sk)",
-        "ALTER TABLE dim_seller ADD CONSTRAINT PK_dim_seller PRIMARY KEY (seller_sk)",
-        "ALTER TABLE dim_date ADD CONSTRAINT PK_dim_date PRIMARY KEY (date_sk)",
-        "ALTER TABLE dim_order_status_detail ADD CONSTRAINT PK_dim_order_status_detail PRIMARY KEY (status_sk)",
-        "ALTER TABLE fct_orders ADD CONSTRAINT PK_fct_orders PRIMARY KEY (order_sk)",
-        "ALTER TABLE fct_seller_fulfillment ADD CONSTRAINT PK_fct_seller_fulfillment PRIMARY KEY (fulfillment_sk)",
-        "ALTER TABLE fct_customer_payment ADD CONSTRAINT PK_fct_customer_payment PRIMARY KEY (payment_sk)",
-        "ALTER TABLE fct_customer_review ADD CONSTRAINT PK_fct_customer_review PRIMARY KEY (review_sk)",
-    ]
-    for sql in pks:
-        cur.execute(sql)
-        print("    ✅ PK added", flush=True)
-
-    print("  🔗 Adding Foreign Keys...", flush=True)
-    fks = [
-        "ALTER TABLE fct_orders ADD CONSTRAINT FK_fct_orders_customer FOREIGN KEY (customer_sk_fk) REFERENCES dim_customer(customer_sk)",
-        "ALTER TABLE fct_orders ADD CONSTRAINT FK_fct_orders_status FOREIGN KEY (status_sk_fk) REFERENCES dim_order_status_detail(status_sk)",
-        "ALTER TABLE fct_orders ADD CONSTRAINT FK_fct_orders_purchase_date FOREIGN KEY (purchase_date_sk_fk) REFERENCES dim_date(date_sk)",
-        "ALTER TABLE fct_orders ADD CONSTRAINT FK_fct_orders_estimated_date FOREIGN KEY (estimated_delivery_date_sk_fk) REFERENCES dim_date(date_sk)",
-        "ALTER TABLE fct_orders ADD CONSTRAINT FK_fct_orders_actual_date FOREIGN KEY (actual_delivery_date_sk_fk) REFERENCES dim_date(date_sk)",
-        "ALTER TABLE fct_seller_fulfillment ADD CONSTRAINT FK_fct_sf_customer FOREIGN KEY (customer_sk_fk) REFERENCES dim_customer(customer_sk)",
-        "ALTER TABLE fct_seller_fulfillment ADD CONSTRAINT FK_fct_sf_product FOREIGN KEY (product_sk_fk) REFERENCES dim_product(product_sk)",
-        "ALTER TABLE fct_seller_fulfillment ADD CONSTRAINT FK_fct_sf_seller FOREIGN KEY (seller_sk_fk) REFERENCES dim_seller(seller_sk)",
-        "ALTER TABLE fct_seller_fulfillment ADD CONSTRAINT FK_fct_sf_purchase_date FOREIGN KEY (purchase_date_sk_fk) REFERENCES dim_date(date_sk)",
-        "ALTER TABLE fct_seller_fulfillment ADD CONSTRAINT FK_fct_sf_shipping_date FOREIGN KEY (shipping_limit_date_sk_fk) REFERENCES dim_date(date_sk)",
-        "ALTER TABLE fct_customer_payment ADD CONSTRAINT FK_fct_payment_customer FOREIGN KEY (customer_sk_fk) REFERENCES dim_customer(customer_sk)",
-        "ALTER TABLE fct_customer_review ADD CONSTRAINT FK_fct_review_customer FOREIGN KEY (customer_sk_fk) REFERENCES dim_customer(customer_sk)",
-        "ALTER TABLE fct_customer_review ADD CONSTRAINT FK_fct_review_date FOREIGN KEY (review_creation_date_sk_fk) REFERENCES dim_date(date_sk)",
-    ]
-    for sql in fks:
-        cur.execute(sql)
-        print("    ✅ FK added", flush=True)
-
-    cur.close()
-    conn.close()
-    print("  ✅ All constraints added successfully!", flush=True)
-except Exception as e:
-    print(f"  ❌ Error adding constraints: {e}", flush=True)
-    raise
-
-print("\n" + "=" * 60)
-print("🎉 GOLD LAYER COMPLETE!")
-print("=" * 60)
+constraints = [
+    "ALTER TABLE public.dim_customer ADD PRIMARY KEY (customer_sk)",
+    "ALTER TABLE public.dim_seller ADD PRIMARY KEY (seller_sk)",
+    "ALTER TABLE public.dim_product ADD PRIMARY KEY (product_sk)",
+    "ALTER TABLE public.dim_date ADD PRIMARY KEY (date_sk)",
+    "ALTER TABLE public.dim_delivery_status ADD PRIMARY KEY (delivery_status_sk)",
+    "ALTER TABLE public.dim_review_sentiment ADD PRIMARY KEY (review_sentiment_sk)",
+    "ALTER TABLE public.dim_payment_type ADD PRIMARY KEY (payment_type_sk)",
+    "ALTER TABLE public.dim_geolocation ADD PRIMARY KEY (geolocation_sk)",
+    "ALTER TABLE public.fct_order_sales ADD PRIMARY KEY (sales_fact_sk)",
+    "ALTER TABLE public.fct_order_delivery ADD PRIMARY KEY (delivery_fact_sk)",
+    "ALTER TABLE public.fct_customer_reviews ADD PRIMARY KEY (review_fact_sk)",
+    "ALTER TABLE public.fct_seller_fulfillment ADD PRIMARY KEY (fulfillment_fact_sk)",
+    "ALTER TABLE public.fct_order_sales ADD FOREIGN KEY (product_sk_fk) REFERENCES public.dim_product(product_sk)",
+    "ALTER TABLE public.fct_order_sales ADD FOREIGN KEY (seller_sk_fk) REFERENCES public.dim_seller(seller_sk)",
+    "ALTER TABLE public.fct_order_sales ADD FOREIGN KEY (customer_sk_fk) REFERENCES public.dim_customer(customer_sk)",
+    "ALTER TABLE public.fct_order_sales ADD FOREIGN KEY (payment_type_sk_fk) REFERENCES public.dim_payment_type(payment_type_sk)",
+    "ALTER TABLE public.fct_order_sales ADD FOREIGN KEY (sales_date_sk) REFERENCES public.dim_date(date_sk)",
+    "ALTER TABLE public.fct_order_delivery ADD FOREIGN KEY (customer_sk_fk) REFERENCES public.dim_customer(customer_sk)",
+    "ALTER TABLE public.fct_order_delivery ADD FOREIGN KEY (seller_sk_fk) REFERENCES public.dim_seller(seller_sk)",
+    "ALTER TABLE public.fct_order_delivery ADD FOREIGN KEY (delivery_status_sk_fk) REFERENCES public.dim_delivery_status(delivery_status_sk)",
+    "ALTER TABLE public.fct_order_delivery ADD FOREIGN KEY (purchase_date_sk) REFERENCES public.dim_date(date_sk)",
+    "ALTER TABLE public.fct_customer_reviews ADD FOREIGN KEY (seller_sk_fk) REFERENCES public.dim_seller(seller_sk)",
+    "ALTER TABLE public.fct_customer_reviews ADD FOREIGN KEY (review_sentiment_sk_fk) REFERENCES public.dim_review_sentiment(review_sentiment_sk)",
+    "ALTER TABLE public.fct_customer_reviews ADD FOREIGN KEY (review_date_sk) REFERENCES public.dim_date(date_sk)",
+    "ALTER TABLE public.fct_seller_fulfillment ADD FOREIGN KEY (seller_sk_fk) REFERENCES public.dim_seller(seller_sk)",
+    "ALTER TABLE public.fct_seller_fulfillment ADD FOREIGN KEY (product_sk_fk) REFERENCES public.dim_product(product_sk)",
+    "ALTER TABLE public.fct_seller_fulfillment ADD FOREIGN KEY (purchase_date_sk) REFERENCES public.dim_date(date_sk)",
+]
+pg_exec(constraints)
 
 spark.stop()
+print("Gold layer completed.", flush=True)

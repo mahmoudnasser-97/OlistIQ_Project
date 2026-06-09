@@ -1,0 +1,9 @@
+# requirements.txt - Place in dagster/ root directory
+dagster>=1.5.0
+dagster-pyspark>=0.22.0
+pyspark>=3.4.0
+delta-spark>=2.4.0
+psycopg2-binary>=2.9.0
+pyarrow>=12.0.0
+pandas>=2.0.0
+sqlalchemy>=2.0.0

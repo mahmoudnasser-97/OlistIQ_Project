@@ -1,453 +1,187 @@
 """
-=============================================================================
-dagster/pipelines/olist_assets.py
-=============================================================================
-Dagster asset pipeline for the Olist data platform.
+Olist Data Platform – Dagster Pipeline
+=======================================
+Orchestrates the full medallion ETL:
+  Bronze  → transform_silver → Silver
+  Silver  → aggregate_gold   → Gold (Delta + Postgres public schema)
+  Gold    → load_data_marts  → Mart schemas in Postgres
+  Silver/Gold → data_quality → QA issues in s3a://silver/QA_Issues/
 
-Asset graph — matches your actual spark job scripts exactly:
-
-  [bronze_all_tables]
-        │
-        ▼
-  [silver_tables]
-        │
-        ▼
-  [data_quality_checks]       ← blocking gate: exits 1 on failure
-        │
-        ▼
-  [gold_layer]                ← dims + facts + PKs/FKs in PostgreSQL
-        │
-        ▼
-  [data_marts]                ← 9 mart_* tables for Power BI
-
-Schedule: daily at 02:00 UTC
-Dagster UI: http://localhost:3000
-=============================================================================
+All Spark jobs are submitted to the standalone Spark cluster via
+spark-submit (subprocess), matching the existing docker-compose setup.
 """
 
 import subprocess
-import psycopg2
 from dagster import (
     asset,
     AssetExecutionContext,
-    AssetCheckResult,
-    AssetCheckSeverity,
-    asset_check,
     Definitions,
-    ScheduleDefinition,
     define_asset_job,
+    AssetSelection,
+    ScheduleDefinition,
     RetryPolicy,
     Backoff,
-    Output,
-    MetadataValue,
 )
 
 # ---------------------------------------------------------------------------
-# Constants — match paths used inside the spark job scripts
+# Helpers
 # ---------------------------------------------------------------------------
+
 SPARK_SUBMIT = "/opt/spark/bin/spark-submit"
 SPARK_MASTER = "spark://spark-master:7077"
-JOBS_DIR     = "/opt/spark_jobs"
+JOBS_DIR = "/opt/spark_jobs"
 
-PG_HOST = "postgres-dw"
-PG_PORT = 5432
-PG_DB   = "olist_dw"
-PG_USER = "olist"
-PG_PASS = "olist"
+DELTA_PACKAGES = (
+    "io.delta:delta-core_2.12:2.4.0,"
+    "org.apache.hadoop:hadoop-aws:3.3.4,"
+    "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+)
+
+PG_PACKAGE = "org.postgresql:postgresql:42.7.2"
+
+S3A_CONF = [
+    "--conf", "spark.hadoop.fs.s3a.endpoint=http://minio:9000",
+    "--conf", "spark.hadoop.fs.s3a.access.key=minioadmin",
+    "--conf", "spark.hadoop.fs.s3a.secret.key=minioadmin",
+    "--conf", "spark.hadoop.fs.s3a.path.style.access=true",
+    "--conf", "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
+]
+
+DELTA_CONF = [
+    "--conf", "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension",
+    "--conf", "spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
+]
 
 
-# ---------------------------------------------------------------------------
-# Helper: run a spark-submit and stream logs to Dagster
-# Raises RuntimeError if the process exits with non-zero code, which causes
-# Dagster to mark the asset as failed and stop the run.
-# ---------------------------------------------------------------------------
-def spark_submit(context: AssetExecutionContext, script: str) -> None:
-    cmd = [SPARK_SUBMIT, "--master", SPARK_MASTER, f"{JOBS_DIR}/{script}"]
-    context.log.info(f"Submitting: {' '.join(cmd)}")
+def _submit(context: AssetExecutionContext, script: str, extra_packages: str = "") -> None:
+    """Run a Spark job and stream its logs to Dagster."""
+    packages = DELTA_PACKAGES
+    if extra_packages:
+        packages = f"{packages},{extra_packages}"
 
-    process = subprocess.Popen(
+    cmd = [
+        SPARK_SUBMIT,
+        "--master", SPARK_MASTER,
+        "--packages", packages,
+        *DELTA_CONF,
+        *S3A_CONF,
+        "--conf", "spark.sql.shuffle.partitions=4",
+        f"{JOBS_DIR}/{script}",
+    ]
+
+    context.log.info("Submitting: %s", " ".join(cmd))
+
+    with subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1,
-    )
+    ) as proc:
+        for line in proc.stdout:
+            context.log.info(line.rstrip())
+        proc.wait()
 
-    for line in process.stdout:
-        line = line.rstrip()
-        if line:
-            context.log.info(line)
-
-    process.wait()
-
-    if process.returncode != 0:
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"spark-submit failed: {script} exited with code {process.returncode}"
+            f"spark-submit exited with code {proc.returncode} for {script}"
         )
 
 
 # ---------------------------------------------------------------------------
-# Helper: connect to postgres-dw and return a psycopg2 connection
+# Assets – one per pipeline stage
 # ---------------------------------------------------------------------------
-def pg_connect():
-    return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT,
-        dbname=PG_DB, user=PG_USER, password=PG_PASS,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helper: get row count from a PostgreSQL table
-# ---------------------------------------------------------------------------
-def pg_count(table: str) -> int:
-    conn = pg_connect()
-    cur  = conn.cursor()
-    cur.execute(f"SELECT COUNT(*) FROM {table}")
-    count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return count
-
-
-# =============================================================================
-# ASSET 1 — BRONZE
-# Reads all 9 CSVs with inferSchema=False and writes them as Delta to MinIO.
-# =============================================================================
 
 @asset(
-    group_name="bronze",
-    compute_kind="pyspark",
+    group_name="olist_etl",
+    description="Ingest raw CSVs from /opt/data into the Bronze Delta layer (s3a://bronze/).",
     retry_policy=RetryPolicy(max_retries=2, delay=30, backoff=Backoff.EXPONENTIAL),
-    description=(
-        "Reads all 9 Olist CSV files from /opt/data/ and writes them as "
-        "Delta Lake tables to s3a://bronze/csv/. "
-        "All columns kept as strings — typing happens in Silver."
-    ),
 )
-def bronze_all_tables(context: AssetExecutionContext) -> Output:
-    spark_submit(context, "ingest_csv_to_bronze.py")
+def bronze_ingestion(context: AssetExecutionContext) -> None:
+    _submit(context, "ingest_csv_to_bronze.py")
 
-    # Log the table names as metadata so they appear in the Dagster asset page
-    tables = [
-        "orders", "order_items", "order_payments", "order_reviews",
-        "customers", "sellers", "products", "geolocation", "category_translation",
-    ]
-    return Output(
-        value=None,
-        metadata={
-            "tables_written": MetadataValue.int(len(tables)),
-            "bronze_path":    MetadataValue.text("s3a://bronze/csv/"),
-            "table_list":     MetadataValue.text(", ".join(tables)),
-        },
-    )
-
-
-# =============================================================================
-# ASSET 2 — SILVER
-# Cleans, types, enriches, and deduplicates all 8 Bronze tables.
-# Writes 8 Silver Delta tables:
-#   silver_orders, silver_order_items, silver_products, silver_reviews,
-#   silver_customers, silver_sellers, silver_payments, silver_geolocation
-# =============================================================================
 
 @asset(
-    group_name="silver",
-    compute_kind="pyspark",
-    deps=[bronze_all_tables],
-    retry_policy=RetryPolicy(max_retries=1, delay=60),
+    group_name="olist_etl",
     description=(
-        "Transforms Bronze strings into typed, cleaned Silver Delta tables. "
-        "Computes delivery metrics (handling_days, total_lead_time, "
-        "delivery_status_detail), seller performance ratios, and product "
-        "logistics categories."
+        "Clean, cast, and enrich Bronze tables into Silver Delta tables "
+        "(s3a://silver/). Writes QA audit logs for any bad rows."
     ),
+    deps=[bronze_ingestion],
+    retry_policy=RetryPolicy(max_retries=2, delay=30, backoff=Backoff.EXPONENTIAL),
 )
-def silver_tables(context: AssetExecutionContext) -> Output:
-    spark_submit(context, "transform_silver.py")
+def silver_transformation(context: AssetExecutionContext) -> None:
+    _submit(context, "transform_silver.py")
 
-    silver = [
-        "silver_orders", "silver_order_items", "silver_products",
-        "silver_reviews", "silver_customers", "silver_sellers",
-        "silver_payments", "silver_geolocation",
-    ]
-    return Output(
-        value=None,
-        metadata={
-            "tables_written": MetadataValue.int(len(silver)),
-            "silver_path":    MetadataValue.text("s3a://silver/"),
-            "table_list":     MetadataValue.text(", ".join(silver)),
-        },
-    )
-
-
-# =============================================================================
-# ASSET 3 — DATA QUALITY GATE
-# Runs data_quality.py against all 8 Silver tables.
-# The script calls sys.exit(1) on any failure → Dagster marks this asset
-# failed and stops the run before Gold runs on bad data.
-# =============================================================================
 
 @asset(
-    group_name="silver",
-    compute_kind="pyspark",
-    deps=[silver_tables],
+    group_name="olist_etl",
     description=(
-        "Runs data quality checks against all Silver tables. "
-        "Checks: null PKs, row count minimums, value range constraints, "
-        "binary flag correctness, ratio bounds. "
-        "Exits non-zero on failure — blocks Gold from running on bad data."
+        "Build Gold-layer dimensional model (dims + facts) from Silver staging "
+        "tables. Writes to s3a://gold/ and the Postgres public schema."
     ),
+    deps=[silver_transformation],
+    retry_policy=RetryPolicy(max_retries=2, delay=30, backoff=Backoff.EXPONENTIAL),
 )
-def data_quality_gate(context: AssetExecutionContext) -> Output:
-    spark_submit(context, "data_quality.py")
-    return Output(
-        value=None,
-        metadata={"status": MetadataValue.text("All DQ checks passed")},
-    )
+def gold_aggregation(context: AssetExecutionContext) -> None:
+    _submit(context, "aggregate_gold.py", extra_packages=PG_PACKAGE)
 
-
-# =============================================================================
-# ASSET 4 — GOLD LAYER
-# Builds 5 dimensions + 4 fact tables in both MinIO Gold (Delta) and
-# PostgreSQL. Adds PK/FK constraints in PostgreSQL after load.
-# =============================================================================
 
 @asset(
-    group_name="gold",
-    compute_kind="pyspark",
-    deps=[data_quality_gate],
-    retry_policy=RetryPolicy(max_retries=1, delay=60),
+    group_name="olist_etl",
     description=(
-        "Builds the Kimball star schema in MinIO Gold and PostgreSQL:\n"
-        "  Dimensions: dim_date, dim_customer, dim_product, dim_seller, dim_order_status_detail\n"
-        "  Facts: fct_orders, fct_seller_fulfillment, fct_customer_payment, fct_customer_review\n"
-        "Adds primary key and foreign key constraints after load."
+        "Load Gold tables into mart-specific Postgres schemas "
+        "(sales_mart, delivery_performance_mart, …) and into s3a://gold/marts/."
     ),
+    deps=[gold_aggregation],
+    retry_policy=RetryPolicy(max_retries=2, delay=30, backoff=Backoff.EXPONENTIAL),
 )
-def gold_layer(context: AssetExecutionContext) -> Output:
-    spark_submit(context, "aggregate_gold.py")
+def data_mart_load(context: AssetExecutionContext) -> None:
+    _submit(context, "load_data_marts.py", extra_packages=PG_PACKAGE)
 
-    # Collect row counts from PostgreSQL to log as metadata
-    gold_tables = [
-        "dim_date", "dim_customer", "dim_product", "dim_seller",
-        "dim_order_status_detail", "fct_orders",
-        "fct_seller_fulfillment", "fct_customer_payment", "fct_customer_review",
-    ]
-    counts = {}
-    for t in gold_tables:
-        try:
-            counts[t] = pg_count(t)
-        except Exception as e:
-            context.log.warning(f"Could not count {t}: {e}")
-            counts[t] = -1
-
-    total = sum(v for v in counts.values() if v > 0)
-    context.log.info(f"Gold row counts: {counts}")
-
-    return Output(
-        value=None,
-        metadata={
-            "total_rows_loaded": MetadataValue.int(total),
-            **{f"rows_{t}": MetadataValue.int(c) for t, c in counts.items()},
-        },
-    )
-
-
-# =============================================================================
-# ASSET 5 — DATA MARTS (SERVING LAYER)
-# Reads from Gold PostgreSQL tables, builds 9 analytical mart_* tables
-# optimised for Power BI direct connection.
-# =============================================================================
 
 @asset(
-    group_name="serving",
-    compute_kind="pyspark",
-    deps=[gold_layer],
-    retry_policy=RetryPolicy(max_retries=1, delay=30),
+    group_name="olist_etl",
     description=(
-        "Builds 9 Power BI-ready data marts from the Gold layer:\n"
-        "  mart_sales_analytics      — revenue by month/state\n"
-        "  mart_seller_performance   — seller scorecards (Q2)\n"
-        "  mart_seller_alerts        — sellers >10% late in 90 days (Q4)\n"
-        "  mart_product_analytics    — category revenue + delivery (Q1)\n"
-        "  mart_delivery_analytics   — delivery performance by month/state\n"
-        "  mart_customer_analytics   — CLV by state (Q6)\n"
-        "  mart_customer_satisfaction— freight vs satisfaction (Q3)\n"
-        "  mart_order_funnel         — monthly funnel (Q5)\n"
-        "  mart_payment_analytics    — payment type breakdown"
+        "Run integrated data-quality checks across Silver staging tables and "
+        "Postgres Gold tables. Issues are written to s3a://silver/QA_Issues/."
     ),
+    # DQ runs after marts so it can also validate Postgres schema presence.
+    deps=[data_mart_load],
+    retry_policy=RetryPolicy(max_retries=1, delay=15),
 )
-def data_marts(context: AssetExecutionContext) -> Output:
-    spark_submit(context, "load_data_marts.py")
-
-    mart_tables = [
-        "mart_sales_analytics",
-        "mart_seller_performance",
-        "mart_seller_alerts",
-        "mart_product_analytics",
-        "mart_delivery_analytics",
-        "mart_customer_analytics",
-        "mart_customer_satisfaction",
-        "mart_order_funnel",
-        "mart_payment_analytics",
-    ]
-    counts = {}
-    for t in mart_tables:
-        try:
-            counts[t] = pg_count(t)
-        except Exception as e:
-            context.log.warning(f"Could not count {t}: {e}")
-            counts[t] = -1
-
-    context.log.info(f"Mart row counts: {counts}")
-
-    return Output(
-        value=None,
-        metadata={
-            "marts_created":    MetadataValue.int(len(mart_tables)),
-            "powerbi_target_db": MetadataValue.text(f"postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"),
-            **{f"rows_{t}": MetadataValue.int(c) for t, c in counts.items()},
-        },
-    )
+def data_quality_checks(context: AssetExecutionContext) -> None:
+    _submit(context, "data_quality.py", extra_packages=PG_PACKAGE)
 
 
-# =============================================================================
-# ASSET CHECKS — run after materialisation, visible in Dagster UI
-# These supplement (not replace) the data_quality_gate asset.
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Job + Schedule
+# ---------------------------------------------------------------------------
 
-@asset_check(asset=gold_layer, blocking=False)
-def check_fct_orders_not_empty(context):
-    """Warns if fct_orders has 0 rows — means Gold failed silently."""
-    count = pg_count("fct_orders")
-    return AssetCheckResult(
-        passed=count > 0,
-        severity=AssetCheckSeverity.ERROR,
-        metadata={"fct_orders_row_count": MetadataValue.int(count)},
-    )
-
-
-@asset_check(asset=gold_layer, blocking=False)
-def check_dim_date_range(context):
-    """Verifies dim_date covers 2016 (first Olist orders) through 2025."""
-    conn = pg_connect()
-    cur  = conn.cursor()
-    cur.execute("SELECT MIN(year_number), MAX(year_number) FROM dim_date")
-    min_yr, max_yr = cur.fetchone()
-    cur.close()
-    conn.close()
-    passed = (min_yr is not None and min_yr <= 2016 and max_yr >= 2025)
-    return AssetCheckResult(
-        passed=passed,
-        metadata={
-            "min_year": MetadataValue.int(min_yr or 0),
-            "max_year": MetadataValue.int(max_yr or 0),
-        },
-    )
-
-
-@asset_check(asset=data_marts, blocking=False)
-def check_all_marts_populated(context):
-    """Warns if any mart table has 0 rows after the serving job."""
-    marts = [
-        "mart_sales_analytics", "mart_seller_performance", "mart_seller_alerts",
-        "mart_product_analytics", "mart_delivery_analytics",
-        "mart_customer_analytics", "mart_customer_satisfaction",
-        "mart_order_funnel", "mart_payment_analytics",
-    ]
-    empty = []
-    counts = {}
-    for t in marts:
-        c = pg_count(t)
-        counts[t] = c
-        if c == 0:
-            empty.append(t)
-
-    return AssetCheckResult(
-        passed=len(empty) == 0,
-        severity=AssetCheckSeverity.WARN,
-        metadata={
-            "empty_tables": MetadataValue.text(", ".join(empty) if empty else "none"),
-            **{t: MetadataValue.int(c) for t, c in counts.items()},
-        },
-    )
-
-
-@asset_check(asset=data_marts, blocking=False)
-def check_seller_alerts_logic(context):
-    """
-    Verifies that mart_seller_alerts only contains sellers with
-    late_delivery_rate_pct > 10 — confirms the Q4 filter is working.
-    """
-    conn = pg_connect()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*) FROM mart_seller_alerts
-        WHERE late_delivery_rate_pct <= 10
-    """)
-    bad_rows = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM mart_seller_alerts")
-    total = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-
-    return AssetCheckResult(
-        passed=bad_rows == 0,
-        metadata={
-            "sellers_in_alert_table":       MetadataValue.int(total),
-            "rows_violating_10pct_threshold": MetadataValue.int(bad_rows),
-        },
-    )
-
-
-# =============================================================================
-# JOB — groups all 5 assets into a single runnable pipeline
-# =============================================================================
-
-olist_batch_job = define_asset_job(
-    name="olist_batch_pipeline",
-    selection=[
-        "bronze_all_tables",
-        "silver_tables",
-        "data_quality_gate",
-        "gold_layer",
-        "data_marts",
-    ],
-    description="Full Olist batch pipeline: Bronze → Silver → DQ → Gold → Marts",
+olist_full_pipeline = define_asset_job(
+    name="olist_full_pipeline",
+    selection=AssetSelection.groups("olist_etl"),
+    description="End-to-end Olist ETL: Bronze → Silver → Gold → Marts → DQ",
 )
 
-
-# =============================================================================
-# SCHEDULE — runs the full pipeline every day at 02:00 UTC
-# Enable it in the Dagster UI: Automation → olist_daily_2am → toggle Running
-# =============================================================================
-
-daily_schedule = ScheduleDefinition(
-    job=olist_batch_job,
-    cron_schedule="0 2 * * *",
-    name="olist_daily_2am",
-    description="Runs the full Olist batch pipeline at 02:00 UTC daily",
+olist_daily_schedule = ScheduleDefinition(
+    name="olist_daily_schedule",
+    job=olist_full_pipeline,
+    cron_schedule="0 3 * * *",   # 03:00 UTC every day
+    description="Trigger the full Olist pipeline daily at 03:00 UTC",
 )
 
-
-# =============================================================================
-# DEFINITIONS — the single top-level object workspace.yaml points at
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Definitions (entry-point consumed by Dagster's workspace.yaml)
+# ---------------------------------------------------------------------------
 
 defs = Definitions(
     assets=[
-        bronze_all_tables,
-        silver_tables,
-        data_quality_gate,
-        gold_layer,
-        data_marts,
+        bronze_ingestion,
+        silver_transformation,
+        gold_aggregation,
+        data_mart_load,
+        data_quality_checks,
     ],
-    asset_checks=[
-        check_fct_orders_not_empty,
-        check_dim_date_range,
-        check_all_marts_populated,
-        check_seller_alerts_logic,
-    ],
-    jobs=[olist_batch_job],
-    schedules=[daily_schedule],
+    jobs=[olist_full_pipeline],
+    schedules=[olist_daily_schedule],
 )
